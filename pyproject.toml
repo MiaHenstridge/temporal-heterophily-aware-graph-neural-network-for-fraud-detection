@@ -1,0 +1,41 @@
+[project]
+name = "pyg-uv-env"
+version = "0.1.0"
+description = "GNN Research Environment"
+readme = "README.md"
+requires-python = "==3.12.*"
+dependencies = [
+    "torch==2.6.0",
+    "torchvision",
+    "torchaudio",
+    "torch-scatter",
+    "torch-sparse",
+    "torch-cluster",
+    "torch-spline-conv",
+    "torch-geometric==2.6.1",
+    "mlflow",
+    "pandas",
+    "numpy",
+    "matplotlib",
+    "seaborn",
+    "scikit-learn",
+    "networkx",
+    "xgboost",
+    "notebook",
+    "ipykernel",
+    "optuna",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126" }]
+torchvision = [{ index = "pytorch-cu126" }]
+torchaudio = [{ index = "pytorch-cu126" }]
+torch-scatter = [{ url = "https://data.pyg.org/whl/torch-2.6.0%2Bcu126/torch_scatter-2.1.2%2Bpt26cu126-cp312-cp312-linux_x86_64.whl" }]
+torch-sparse = [{ url = "https://data.pyg.org/whl/torch-2.6.0%2Bcu126/torch_sparse-0.6.18%2Bpt26cu126-cp312-cp312-linux_x86_64.whl" }]
+torch-cluster = [{ url = "https://data.pyg.org/whl/torch-2.6.0%2Bcu126/torch_cluster-1.6.3%2Bpt26cu126-cp312-cp312-linux_x86_64.whl" }]
+torch-spline-conv = [{ url = "https://data.pyg.org/whl/torch-2.6.0%2Bcu126/torch_spline_conv-1.2.2%2Bpt26cu126-cp312-cp312-linux_x86_64.whl" }]

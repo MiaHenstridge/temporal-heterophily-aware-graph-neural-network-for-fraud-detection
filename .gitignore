@@ -1,0 +1,26 @@
+# Datasets
+datasets/
+
+# Processed data
+processed_data/
+
+# MLflow
+mlflow.db
+mlruns/
+
+# Models
+models/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Virtual environment
+.venv/
+
+# UV
+uv.lock
