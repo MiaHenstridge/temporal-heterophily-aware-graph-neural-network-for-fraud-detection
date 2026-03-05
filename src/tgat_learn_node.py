@@ -2,6 +2,7 @@ import math
 import logging
 import time
 import sys
+import os
 import random
 import argparse
 
@@ -16,6 +17,12 @@ from graph_process import NeighborFinder
 
 import mlflow
 import mlflow.pytorch
+from namespaces import DA
+
+os.chdir('/home/mai/notebooks/final_thesis/')
+print(os.getcwd())
+
+os.makedirs(DA.paths.log, exist_ok=True)
 
 class LR(torch.nn.Module):
     def __init__(self, dim, drop=0.3):
@@ -39,9 +46,10 @@ random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
 
-# argument parser
+######################## argument parser #########################
 parser = argparse.ArgumentParser(description="Interface for TGAT experiments on node classification")
-parser.add_argument('-d', '--data', type=str, help='data sources to use, try wikipedia or reddit', default='wikipedia')
+parser.add_argument('-d', '--data', type=str, help='data sources to use, try dgraphfin', default='dgraphfin')
+
 parser.add_argument('--bs', type=int, default=30, help='batch_size')
 parser.add_argument('--prefix', type=str, default='')
 parser.add_argument('--n_degree', type=int, default=20, help='number of neighbors to sample')
@@ -90,12 +98,12 @@ NODE_DIM = args.node_dim
 TIME_DIM = args.time_dim
 
 
-# logger
+###################### logger ######################
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 
-fh = logging.FileHandler('log/{}.log'.format(str(time.time())))
+fh = logging.FileHandler(os.path.join(DA.paths.log, '{}.log'.format(str(time.time()))))
 fh.setLevel(logging.DEBUG)
 
 ch = logging.StreamHandler()
@@ -110,4 +118,93 @@ logger.addHandler(ch)
 logger.info(args)
 
 
-# load data and train val test split
+################## load data and train val test split ##################
+g_df = pd.read_csv(os.path.join(DA.paths.output_data_graph, f'ml_{DATA}.csv'))
+e_feat = np.load(os.path.join(DA.paths.output_data_graph, f'ml_{DATA}.npy'))
+n_feat = np.load(os.path.join(DA.paths.output_data_graph, f'ml_{DATA}_node.npy'))
+
+# load original masks and labels from dgraphfin.npz
+raw = np.load(os.path.join(DA.paths.data, 'dgraphfin.npz'))
+train_mask = raw['train_mask']
+val_mask   = raw['valid_mask']
+test_mask  = raw['test_mask']
+labels     = raw['y']
+
+# remap labels to 0 and 1
+def remap_labels(node_labels):
+    return (node_labels == 1).astype(int)
+
+train_labels = remap_labels(labels[train_mask])
+val_labels   = remap_labels(labels[val_mask])
+test_labels  = remap_labels(labels[test_mask])
+
+# convert 0-based node indices to 1-based (TGAT convention)
+train_nodes = train_mask + 1
+val_nodes   = val_mask + 1
+test_nodes  = test_mask + 1
+
+# full edge arrays
+src_l = g_df['u'].values
+dst_l = g_df['i'].values
+ts_l = g_df['ts'].values
+e_idx_l = g_df['idx'].values
+label_l = g_df['label'].values
+
+max_src_index = src_l.max()
+max_idx = max(src_l.max(), dst_l.max())
+total_node_set = set(np.unique(np.hstack([src_l, dst_l])))
+
+# train/val/test node sets
+train_node_set = set(train_nodes)
+val_node_set   = set(val_nodes)
+test_node_set  = set(test_nodes)
+
+# flags for training, validation, and test edges
+train_flag = np.array([u in train_node_set and i in train_node_set for u, i in zip(src_l, dst_l)])
+val_flag = np.array([u in val_node_set and i in val_node_set for u, i in zip(src_l, dst_l)])
+test_flag = np.array([u in test_node_set and i in test_node_set for u, i in zip(src_l, dst_l)])
+
+
+# build train/val/test edge sets 
+if args.tune:
+    train_src_l = src_l[train_flag]
+    train_dst_l = dst_l[train_flag]
+    train_ts_l = ts_l[train_flag]
+    train_e_idx_l = e_idx_l[train_flag]
+    train_label_l = label_l[train_flag]
+    # use the validation as test dataset
+    test_src_l = src_l[val_flag]
+    test_dst_l = dst_l[val_flag]
+    test_ts_l = ts_l[val_flag]
+    test_e_idx_l = e_idx_l[val_flag]
+    test_label_l = label_l[val_flag]
+else:
+    logger.info('Training use all train data')
+    train_src_l = src_l[train_flag | val_flag]
+    train_dst_l = dst_l[train_flag | val_flag]
+    train_ts_l = ts_l[train_flag | val_flag]
+    train_e_idx_l = e_idx_l[train_flag | val_flag]
+    train_label_l = label_l[train_flag | val_flag]
+    # test on true test dataset
+    test_src_l = src_l[test_flag]
+    test_dst_l = dst_l[test_flag]
+    test_ts_l = ts_l[test_flag]
+    test_e_idx_l = e_idx_l[test_flag]
+    test_label_l = label_l[test_flag]
+
+##### intialize data structure for graph and edge sampling #####
+adj_list = [[] for _ in range(max_idx + 1)]
+for src, dst, eidx, ts in zip(train_src_l, train_dst_l, train_e_idx_l, train_ts_l):
+    adj_list[src].append((dst, eidx, ts))
+    adj_list[dst].append((src, eidx, ts))  # undirected
+
+train_ngh_finder = NeighborFinder(adj_list, uniform=UNIFORM)
+
+# full graph with all the data for the test and validation purpose
+full_adj_list = [[] for _ in range(max_idx + 1)]
+for src, dst, eidx, ts in zip(src_l, dst_l, e_idx_l, ts_l):
+    full_adj_list[src].append((dst, eidx, ts))
+    full_adj_list[dst].append((src, eidx, ts))  # undirected
+
+full_ngh_finder = NeighborFinder(full_adj_list, uniform=UNIFORM)
+

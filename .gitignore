@@ -12,7 +12,7 @@ mlruns/
 models/
 
 # log
-log/
+logs/
 
 # Python cache
 __pycache__/
