@@ -208,3 +208,30 @@ for src, dst, eidx, ts in zip(src_l, dst_l, e_idx_l, ts_l):
 
 full_ngh_finder = NeighborFinder(full_adj_list, uniform=UNIFORM)
 
+
+########## model initialization ##########
+device = torch.device('cuda:{}'.format(GPU) if torch.cuda.is_available() else 'cpu')
+tgan = TGAN(
+    ngh_finder=train_ngh_finder,
+    n_feat=n_feat,
+    e_feat=e_feat,
+    num_layers=NUM_LAYER,
+    use_time=USE_TIME,
+    agg_method=AGG_METHOD,
+    attn_mode=ATTN_MODE,
+    seq_len=SEQ_LEN,
+    n_head=NUM_HEADS,
+    drop_out=DROP_OUT,
+    node_dim=NODE_DIM,
+    time_dim=TIME_DIM,
+)
+logger.info("Model initialized with {} parameters".format(sum(p.numel() for p in tgan.parameters())))
+
+optimizer = torch.optim.Adam(tgan.parameters(), lr=LEARNING_RATE)
+logger.info("Optimizer initialized with learning rate: {}".format(LEARNING_RATE))
+
+tgan = tgan.to(device)
+logger.info("Model loaded to device: {}".format(device))
+
+
+

@@ -306,9 +306,11 @@ class TGAN(torch.nn.Module):
             self.attn_model_list = torch.nn.ModuleList([
                 AttnModel(self.feat_dim,
                          self.feat_dim,
+                         self.feat_dim,
                          attn_mode=attn_mode,
                          n_head=n_head,
-                         drop_out=drop_out) for _ in range(num_layers)
+                         drop_out=drop_out,
+                         ) for _ in range(num_layers)
             ])
 
         elif agg_method == 'lstm':
