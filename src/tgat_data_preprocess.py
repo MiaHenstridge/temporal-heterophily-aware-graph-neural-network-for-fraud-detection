@@ -26,6 +26,7 @@ def process_data(data_path, output_path, data_name='dgraphfin'):
     sorted_order = np.argsort(edge_timestamp)
     edge_index = edge_index[sorted_order]
     edge_type = edge_type[sorted_order]
+    edge_timestamp = edge_timestamp[sorted_order]
 
     # Build csv file: u, i, ts, label, idx
     # node idx are 1-based for
