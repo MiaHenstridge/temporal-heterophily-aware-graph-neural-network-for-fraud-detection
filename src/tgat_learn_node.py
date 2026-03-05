@@ -14,6 +14,7 @@ from sklearn.metrics import roc_auc_score, matthews_corrcoef, f1_score, recall_s
 
 from modules import TGAN
 from graph_process import NeighborFinder
+from utils import EarlyStopMonitor, RandEdgeSampler
 
 import mlflow
 import mlflow.pytorch
@@ -96,6 +97,11 @@ LEARNING_RATE = args.lr
 NODE_LAYER = 1
 NODE_DIM = args.node_dim
 TIME_DIM = args.time_dim
+
+########## model saving and checkpointing ##########
+MODEL_SAVE_PATH = f'./saved_models/{args.prefix}-{args.agg_method}-{args.attn_mode}-{args.data}.pth'
+get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{args.prefix}-{args.agg_method}-{args.attn_mode}-{args.data}-{epoch}.pth'
+
 
 
 ###################### logger ######################
@@ -230,8 +236,153 @@ logger.info("Model initialized with {} parameters".format(sum(p.numel() for p in
 optimizer = torch.optim.Adam(tgan.parameters(), lr=LEARNING_RATE)
 logger.info("Optimizer initialized with learning rate: {}".format(LEARNING_RATE))
 
+# LR classifier on top of TGAN embeddings
+lr_model = LR(n_feat.shape[1] if NODE_DIM is None else NODE_DIM).to(device)
+lr_optimizer = torch.optim.Adam(lr_model.parameters(), lr=LEARNING_RATE)
+
+criterion = torch.nn.BCELoss()
+
 tgan = tgan.to(device)
 logger.info("Model loaded to device: {}".format(device))
 
+num_instance = len(train_src_l)
+num_batch = math.ceil(num_instance / BATCH_SIZE)
+logger.debug("Number of training instances: {}, number of batches per epoch: {}".format(num_instance, num_batch))
+idx_list = np.arange(num_instance)
+np.random.shuffle(idx_list)
+
+early_stopper = EarlyStopMonitor()
+
+############ train and evaluation loop ############
+def eval_node_classification(tgan, lr_model, nodes, labels, ts_l, num_neighbors, device):
+    """Evaluate node classification performance."""
+    tgan.eval()
+    lr_model.eval()
+    
+    num_instance = len(nodes)
+    num_batch = math.ceil(num_instance / BATCH_SIZE)
+    
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for k in range(num_batch):
+            s_idx = k * BATCH_SIZE
+            e_idx = min(num_instance, s_idx + BATCH_SIZE)
+            
+            node_batch = nodes[s_idx:e_idx]
+            label_batch = labels[s_idx:e_idx]
+            
+            # get cut_time for each node: use the last timestamp in the graph
+            # so the node can see all its historical edges
+            ts_batch = np.array([ts_l[src_l == n].max() if (src_l == n).any() 
+                                  else ts_l.max() for n in node_batch])
+            
+            node_embed = tgan.tem_conv(node_batch, ts_batch, NODE_LAYER, num_neighbors)
+            pred = lr_model(node_embed).sigmoid().squeeze(1)
+            
+            all_preds.append(pred.cpu().numpy())
+            all_labels.append(label_batch)
+    
+    all_preds  = np.concatenate(all_preds)
+    all_labels = np.concatenate(all_labels)
+    pred_label = (all_preds > 0.5).astype(int)
+    
+    auc = roc_auc_score(all_labels, all_preds)
+    f1  = f1_score(all_labels, pred_label)
+    mcc = matthews_corrcoef(all_labels, pred_label)
+    rc  = recall_score(all_labels, pred_label)
+    pr  = precision_score(all_labels, pred_label)
+    
+    return auc, f1, mcc, rc, pr
+
+############ node-level cut times (vectorized) ############
+# for each node, find its latest timestamp in the edge list
+# used so the model can see all historical edges when generating embeddings
+node_last_ts = np.zeros(max_idx + 2, dtype=np.float32)
+for n, t in zip(src_l, ts_l):
+    if t > node_last_ts[n]:
+        node_last_ts[n] = t
+for n, t in zip(dst_l, ts_l):
+    if t > node_last_ts[n]:
+        node_last_ts[n] = t
 
 
+# train loop
+for epoch in range(NUM_EPOCH):
+    # training using only training graph
+    tgan.ngh_finder = train_ngh_finder
+    tgan.train()
+    lr_model.train()
+
+    auc, f1, m_loss = [], [], []
+    np.random.shuffle(idx_list)
+    logger.info("Epoch {}: Starting training...".format(epoch))
+    
+    for k in range(num_batch):
+        s_idx = k*BATCH_SIZE                                # start index of the batch
+        e_idx = min(num_instance-1, s_idx + BATCH_SIZE)     # end index of the batch
+        batch_idx = idx_list[s_idx:e_idx]                    # indices of the instances in the batch
+        
+        node_batch = train_nodes[batch_idx]
+        label_batch = train_labels[batch_idx]
+        ts_batch = node_last_ts[batch_idx]
+
+        # get node embeddings from TGAN
+        node_embed = tgan.tem_conv(node_batch, ts_batch, NODE_LAYER, NUM_NEIGHBORS)
+
+        # classify
+        pred = lr_model(node_embed).sigmoid().squeeze(1)
+        label_tensor = torch.tensor(label_batch, dtype=torch.float, device=device)
+
+        loss = criterion(pred, label_tensor)
+
+        optimizer.zero_grad()
+        lr_optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        lr_optimizer.step()
+
+        # training metrics
+        with torch.no_grad():
+            pred_np = pred.cpu().detach().numpy()
+            pred_label = (pred_np > 0.5).astype(int)
+            m_loss.append(loss.item())
+            auc.append(roc_auc_score(label_batch, pred_np))
+            f1.append(f1_score(label_batch, pred_label, zero_division=0))
+
+    # validation using full graph data
+    tgan.ngh_finder = full_ngh_finder
+    val_ts_batch = node_last_ts[val_nodes]
+    val_auc, val_f1, val_mcc, val_rc, val_pr = eval_node_classification(
+        tgan, lr_model, 
+        val_nodes, val_labels, val_ts_batch, 
+        NUM_NEIGHBORS, device)
+
+    # logging
+    logger.info('epoch: {}:'.format(epoch))
+    logger.info('Epoch mean loss: {}'.format(np.mean(m_loss)))
+    logger.info('train auc: {:.4f}, val auc: {:.4f}'.format(np.mean(auc), val_auc))
+    logger.info('train f1:  {:.4f}, val f1:  {:.4f}'.format(np.mean(f1),  val_f1))
+    logger.info('val mcc: {:.4f}, val recall: {:.4f}, val precision: {:.4f}'.format(val_mcc, val_rc, val_pr))
+
+    # early stopping check
+    if early_stopper.early_stop_check(val_auc):
+        logger.info('No improvement over {} epochs, stop training'.format(early_stopper.max_round))
+        logger.info(f'Loading the best model at epoch {early_stopper.best_epoch}')
+        tgan.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch)))
+        tgan.eval()
+        lr_model.eval()
+        break
+    else:
+        torch.save(tgan.state_dict(), get_checkpoint_path(epoch)) 
+
+
+############ final test evaluation ############
+tgan.ngh_finder = full_ngh_finder
+test_auc, test_f1, test_mcc, test_rc, test_pr = eval_node_classification(
+    tgan, lr_model, test_nodes, test_labels, ts_l, NUM_NEIGHBORS, device
+)
+logger.info('Test auc: {:.4f}, f1: {:.4f}, mcc: {:.4f}, recall: {:.4f}, precision: {:.4f}'.format(
+    test_auc, test_f1, test_mcc, test_rc, test_pr
+))
