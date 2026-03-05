@@ -200,7 +200,7 @@ class LSTMPool(torch.nn.Module):
         seq_x = torch.cat([seq, seq_e, seq_t], dim=2)
         _, (hn, _) = self.lstm(seq_x)
         hn = hn[-1, :, :]    # hn.squeeze(dim=0)
-        out = self.merger.forward(hn, src)
+        output = self.merger.forward(hn, src)
         return output, None
 
 
@@ -345,29 +345,29 @@ class TGAN(torch.nn.Module):
 
         self.affinity_score = MergeLayer(self.feat_dim, self.feat_dim, self.feat_dim, 1)    # torch.nn.Bilinear(self.feat_dim, self.feat_dim, 1, bias=True)
 
-    def forward(self, src_idx_1, target_idx_1, cut_time_1, num_neighbors=20):
-        src_embed = self.tem_conv(src_idx_1, cut_time_1, self.num_layers, num_neighbors)
-        target_embed = self.tem_conv(target_idx_1, cut_time_1, self.num_layers, num_neighbors)
+    def forward(self, src_idx_l, target_idx_l, cut_time_l, num_neighbors=20):
+        src_embed = self.tem_conv(src_idx_l, cut_time_l, self.num_layers, num_neighbors)
+        target_embed = self.tem_conv(target_idx_l, cut_time_l, self.num_layers, num_neighbors)
         score = self.affinity_score(src_embed, target_embed).squeeze(dim=-1)
         return score
 
-    def contrast(self, src_idx_1, target_idx_1, background_idx_1, cut_time_1, num_neighbors=20):
-        src_embed = self.tem_conv(src_idx_1, cut_time_1, self.num_layers, num_neighbors)
-        target_embed = self.tem_conv(target_idx_1, cut_time_1, self.num_layers, num_neighbors)
-        background_embed = self.tem_conv(background_idx_1, cut_time_1, self.num_layers, num_neighbors)
+    def contrast(self, src_idx_l, target_idx_l, background_idx_l, cut_time_l, num_neighbors=20):
+        src_embed = self.tem_conv(src_idx_l, cut_time_l, self.num_layers, num_neighbors)
+        target_embed = self.tem_conv(target_idx_l, cut_time_l, self.num_layers, num_neighbors)
+        background_embed = self.tem_conv(background_idx_l, cut_time_l, self.num_layers, num_neighbors)
         pos_score = self.affinity_score(src_embed, target_embed).squeeze(dim=-1)
         neg_score = self.affinity_score(src_embed, background_embed).squeeze(dim=-1)
         return pos_score.sigmoid(), neg_score.sigmoid()
 
-    def tem_conv(self, src_idx_1, cut_time_1, curr_layers, num_neighbors=20):
+    def tem_conv(self, src_idx_l, cut_time_l, curr_layers, num_neighbors=20):
         assert curr_layers >= 0
 
         device = self.n_feat_th.device
-        batch_size = len(src_idx_1)
+        batch_size = len(src_idx_l)
 
-        src_node_batch_th = torch.from_numpy(src_idx_1).long().to(device)
-        cut_time_1_th = torch.from_numpy(cut_time_1).float().to(device)
-        cut_time_1_th = torch.unsqueeze(cut_time_1_th, dim=1)
+        src_node_batch_th = torch.from_numpy(src_idx_l).long().to(device)
+        cut_time_l_th = torch.from_numpy(cut_time_l).float().to(device)
+        cut_time_l_th = torch.unsqueeze(cut_time_l_th, dim=1)
         
         # query node always has the start time -> time span == 0
         src_node_t_embed = self.time_encoder(torch.zeros_like(cut_time_l_th))
@@ -376,19 +376,19 @@ class TGAN(torch.nn.Module):
         if curr_layers == 0:
             return src_node_feat
         else:
-            src_node_conv_feat = self.tem_conv(src_idx_1,
-                                              cut_time_1,
+            src_node_conv_feat = self.tem_conv(src_idx_l,
+                                              cut_time_l,
                                               curr_layers=curr_layers-1, 
                                               num_neighbors=num_neighbors)
             
             src_ngh_node_batch, src_ngh_eidx_batch, src_ngh_t_batch = self.ngh_finder.get_temporal_neighbor(
-                src_idx_1, cut_time_1, num_neighbors=num_neighbors
+                src_idx_l, cut_time_l, num_neighbors=num_neighbors
             )
 
             src_ngh_node_batch_th = torch.from_numpy(src_ngh_node_batch).long().to(device)
             src_ngh_eidx_batch = torch.from_numpy(src_ngh_eidx_batch).long().to(device)
 
-            src_ngh_t_batch_delta = cut_time_1[:, np.newaxis] - src_ngh_t_batch
+            src_ngh_t_batch_delta = cut_time_l[:, np.newaxis] - src_ngh_t_batch
             src_ngh_t_batch_th = torch.from_numpy(src_ngh_t_batch_delta).float().to(device)
 
             # get previous layer's node features
