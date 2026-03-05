@@ -228,6 +228,7 @@ class AttnModel(torch.nn.Module):
 
         # checks if model dim is divisible by attention heads
         assert self.model_dim % n_head == 0
+        self.logger = logging.getLogger(__name__)
         self.attn_mode = attn_mode
         # multihead attention using scaled dot product attn
         if attn_mode == 'prod':
