@@ -20,7 +20,8 @@ import mlflow
 import mlflow.pytorch
 from namespaces import DA
 
-os.chdir('/home/mai/notebooks/final_thesis/')
+# os.chdir('/home/mai/notebooks/final_thesis/')
+os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 print(os.getcwd())
 
 os.makedirs(DA.paths.log, exist_ok=True)

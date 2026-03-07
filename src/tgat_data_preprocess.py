@@ -4,7 +4,8 @@ import os
 from namespaces import DA
 import matplotlib.pyplot as plt
 
-os.chdir('/home/mai/notebooks/final_thesis/')
+# os.chdir('/home/mai/notebooks/final_thesis/')
+os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.getcwd()
 
 os.makedirs(DA.paths.output_data_graph, exist_ok=True)

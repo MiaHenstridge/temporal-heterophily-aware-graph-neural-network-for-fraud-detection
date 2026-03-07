@@ -3,7 +3,7 @@ import numpy as np
 import os
 from namespaces import DA
 
-
+os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # DATA_PATH = '../datasets/DGraphFin/'
 os.makedirs(DA.paths.data, exist_ok=True)
 
