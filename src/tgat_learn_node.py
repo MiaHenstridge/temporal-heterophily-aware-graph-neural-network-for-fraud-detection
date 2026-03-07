@@ -38,7 +38,7 @@ class LR(torch.nn.Module):
     def forward(self, x):
         x = self.act(self.fc_1(x))
         x = self.dropout(x)
-        x = self.act(self.fxc_2(x))
+        x = self.act(self.fc_2(x))
         x = self.dropout(x)
         return self.fc_3(x)
     
@@ -276,8 +276,7 @@ def eval_node_classification(tgan, lr_model, nodes, labels, ts_l, num_neighbors,
             
             # get cut_time for each node: use the last timestamp in the graph
             # so the node can see all its historical edges
-            ts_batch = np.array([ts_l[src_l == n].max() if (src_l == n).any() 
-                                  else ts_l.max() for n in node_batch])
+            ts_batch = node_last_ts[node_batch]
             
             node_embed = tgan.tem_conv(node_batch, ts_batch, NODE_LAYER, num_neighbors)
             pred = lr_model(node_embed).sigmoid().squeeze(1)
@@ -327,12 +326,15 @@ for epoch in range(NUM_EPOCH):
         
         node_batch = train_nodes[batch_idx]
         label_batch = train_labels[batch_idx]
-        ts_batch = node_last_ts[batch_idx]
+        ts_batch = node_last_ts[node_batch]
 
         # get node embeddings from TGAN
+        t0 = time.time()
         node_embed = tgan.tem_conv(node_batch, ts_batch, NODE_LAYER, NUM_NEIGHBORS)
+        print(f"Batch {k}: tem_conv took {time.time()-t0:.2f}s")
 
         # classify
+        t1 = time.time()
         pred = lr_model(node_embed).sigmoid().squeeze(1)
         label_tensor = torch.tensor(label_batch, dtype=torch.float, device=device)
 
@@ -343,6 +345,7 @@ for epoch in range(NUM_EPOCH):
         loss.backward()
         optimizer.step()
         lr_optimizer.step()
+        print(f"Batch {k}: forward+backward took {time.time()-t1:.2f}s")
 
         # training metrics
         with torch.no_grad():
