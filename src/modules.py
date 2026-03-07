@@ -220,6 +220,7 @@ class AttnModel(torch.nn.Module):
         """
         super().__init__()
         self.feat_dim = feat_dim
+        self.edge_dim = edge_dim
         self.time_dim = time_dim
 
         self.edge_in_dim = (feat_dim + edge_dim + time_dim)
@@ -261,7 +262,7 @@ class AttnModel(torch.nn.Module):
         """
 
         src_ext = torch.unsqueeze(src, dim=1)    # src [B, 1, D]
-        src_e_ph = torch.zeros_like(src_ext)
+        src_e_ph = torch.zeros(src_ext.shape[0], 1, self.edge_dim, device=src_ext.device)
         q = torch.cat([src_ext, src_e_ph, src_t], dim=2)    # [B, 1, D+De+Dt] -> [B, 1, D]
         k = torch.cat([seq, seq_e, seq_t], dim=2)           # [B, 1, D+De+Dt] -> [B, 1, D]
 
@@ -306,7 +307,7 @@ class TGAN(torch.nn.Module):
             self.logger.info('Aggregation uses attention model')
             self.attn_model_list = torch.nn.ModuleList([
                 AttnModel(self.feat_dim,
-                         self.feat_dim,
+                         self.e_feat_th.shape[1],
                          self.feat_dim,
                          attn_mode=attn_mode,
                          n_head=n_head,
@@ -317,13 +318,16 @@ class TGAN(torch.nn.Module):
         elif agg_method == 'lstm':
             self.logger.info("Aggregation uses LSTM model")
             self.attn_model_list = torch.nn.ModuleList([
-                LSTMPool(self.feat_dim, self.feat_dim, self.feat_dim) for _ in range(num_layers)
+                LSTMPool(self.feat_dim, 
+                         self.e_feat_th.shape[1], 
+                         self.feat_dim) for _ in range(num_layers)
             ])
             
         elif agg_method == 'mean':
             self.logger.info("Aggregation uses constant mean model")
             self.attn_model_list = torch.nn.ModuleList([
-                MeanPool(self.feat_dim, self.feat_dim) for _ in range(num_layers)
+                MeanPool(self.feat_dim, 
+                         self.e_feat_th.shape[1]) for _ in range(num_layers)
             ])
 
         else:

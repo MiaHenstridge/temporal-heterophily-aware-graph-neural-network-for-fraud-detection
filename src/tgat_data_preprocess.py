@@ -47,12 +47,10 @@ def process_data(data_path, output_path, data_name='dgraphfin'):
     df.to_csv(os.path.join(output_path, f'ml_{data_name}.csv'), index=False)
     print(f"Saved ml_{data_name}.csv — shape: {df.shape}")
 
-    # edge features: [n_edges+1, edge_feat_dim]
-    # use one-hot encoding for edge type
-    # row 0 is the null/padding embedding
-    n_edge_types = int(np.max(edge_type)) + 1
-    edge_feats = np.zeros((n_edges + 1, n_edge_types), dtype=np.float32)
-    edge_feats[1:, :] = np.eye(n_edge_types)[edge_type]   # one-hot
+    # edge features: zeros with same dim as node features (no edge features in original TGAT)
+    node_feat_dim = x.shape[1]  # 17
+
+    edge_feats = np.zeros((n_edges + 1, node_feat_dim), dtype=np.float32)
     np.save(os.path.join(output_path, f'ml_{data_name}.npy'), edge_feats)
     print(f"Saved ml_{data_name}.npy — shape: {edge_feats.shape}")
 

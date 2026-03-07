@@ -14,6 +14,7 @@ from sklearn.metrics import average_precision_score, f1_score, roc_auc_score
 from modules import TGAN
 from graph_process import NeighborFinder
 from utils import EarlyStopMonitor, RandEdgeSampler
+from tqdm import tqdm
 from namespaces import DA
 
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -221,7 +222,7 @@ for epoch in range(NUM_EPOCH):
     np.random.shuffle(idx_list)
     logger.info('start {} epoch'.format(epoch))
 
-    for k in range(num_batch):
+    for k in tqdm(range(num_batch), desc=f'Epoch {epoch}'):
         s_idx = k * BATCH_SIZE
         e_idx = min(num_instance - 1, s_idx + BATCH_SIZE)
         src_l_cut = train_src_l[s_idx:e_idx]
