@@ -56,6 +56,8 @@ parser.add_argument('--memory_dim',      type=int,   default=64)
 parser.add_argument('--n_neighbor',      type=int,   default=10)
 parser.add_argument('--prefix',          type=str,   default='')
 parser.add_argument('--tune',            action='store_true')
+parser.add_argument('--max_round',       type=int,   default=5)
+parser.add_argument('--tolerance',       type=float, default=1e-4)
 
 try:
     args = parser.parse_args()
@@ -74,6 +76,8 @@ TIME_DIM      = args.time_dim
 MEMORY_DIM    = args.memory_dim
 NUM_NEIGHBOR  = args.n_neighbor
 NUM_LAYER     = args.n_layer
+MAX_ROUND     = args.max_round
+TOLERANCE     = args.tolerance
 
 MODEL_SAVE_PATH = f'./saved_models/{args.prefix}-tgn-node-{DATA}.pth'
 get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{args.prefix}-tgn-node-{DATA}-{epoch}.pth'
@@ -323,7 +327,7 @@ def eval_node_clf(nodes, labels_np, edge_flag_for_replay):
 
 
 ################## training ##################
-early_stopper = EarlyStopMonitor()
+early_stopper = EarlyStopMonitor(max_round=MAX_ROUND, higher_better=True, tolerance=TOLERANCE)
 last_saved_epoch = -1  # track which epoch was last checkpointed
 
 # history for plotting
