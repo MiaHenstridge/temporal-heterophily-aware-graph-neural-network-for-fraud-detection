@@ -30,6 +30,9 @@ from torch_geometric.nn import TransformerConv
 
 import mlflow
 import mlflow.pytorch
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend for saving to file
+import matplotlib.pyplot as plt
 from utils import EarlyStopMonitor
 from namespaces import DA
 
@@ -40,7 +43,7 @@ os.makedirs('./saved_checkpoints', exist_ok=True)
 
 ################## argument parser ##################
 parser = argparse.ArgumentParser('TGN Direct Node Classification')
-parser.add_argument('-d', '--data',       type=str,   default='dgraphfin')
+parser.add_argument('-d', '--data',      type=str,   default='dgraphfin')
 parser.add_argument('--bs',              type=int,   default=512)
 parser.add_argument('--n_epoch',         type=int,   default=50)
 parser.add_argument('--lr',              type=float, default=0.0001)
@@ -145,10 +148,6 @@ test_arr [torch.tensor(test_nodes,  dtype=torch.long)] = True
 train_edge_flag = train_arr[src_l] & train_arr[dst_l]
 val_edge_flag   = val_arr[src_l]   & val_arr[dst_l]
 test_edge_flag  = test_arr[src_l]  & test_arr[dst_l]
-
-# replay loaders — used to warm up memory state before node eval
-# we stream all edges to build memory, then classify nodes
-full_replay_loader = TemporalDataLoader(full_data, batch_size=BATCH_SIZE)
 
 logger.info(f'Total edges: {len(src_l)}')
 logger.info(f'Train edges: {train_edge_flag.sum()}, Val edges: {val_edge_flag.sum()}, Test edges: {test_edge_flag.sum()}')
@@ -325,6 +324,11 @@ def eval_node_clf(nodes, labels_np, edge_flag_for_replay):
 
 ################## training ##################
 early_stopper = EarlyStopMonitor()
+last_saved_epoch = -1  # track which epoch was last checkpointed
+
+# history for plotting
+train_loss_hist = []
+val_auc_hist    = []
 
 mlflow.set_experiment('tgn-node-direct')
 with mlflow.start_run():
@@ -388,16 +392,24 @@ with mlflow.start_run():
             'val_precision': val_pr,
         }, step=epoch)
 
+        train_loss_hist.append(np.mean(m_loss))
+        val_auc_hist.append(val_auc)
+
         if early_stopper.early_stop_check(val_auc):
             logger.info(f'Early stopping at epoch {epoch}')
-            tgn_memory.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch)))
             gnn.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch) + '.gnn'))
             node_clf.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch) + '.clf'))
             break
         else:
-            torch.save(tgn_memory.state_dict(), get_checkpoint_path(epoch))
-            torch.save(gnn.state_dict(),         get_checkpoint_path(epoch) + '.gnn')
-            torch.save(node_clf.state_dict(),    get_checkpoint_path(epoch) + '.clf')
+            if early_stopper.best_epoch == epoch:  # only save if this is the new best
+                # remove previous best checkpoint
+                for suffix in ['.gnn', '.clf']:
+                    path = get_checkpoint_path(last_saved_epoch) + suffix
+                    if os.path.exists(path):
+                        os.remove(path)
+                torch.save(gnn.state_dict(),      get_checkpoint_path(epoch) + '.gnn')
+                torch.save(node_clf.state_dict(), get_checkpoint_path(epoch) + '.clf')
+                last_saved_epoch = epoch
 
     # final test — replay all edges for full context
     test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr = eval_node_clf(
@@ -417,8 +429,41 @@ with mlflow.start_run():
         'test_precision': test_pr,
     })
 
-    torch.save(tgn_memory.state_dict(), MODEL_SAVE_PATH)
-    torch.save(gnn.state_dict(),         MODEL_SAVE_PATH + '.gnn')
-    torch.save(node_clf.state_dict(),    MODEL_SAVE_PATH + '.clf')
-    mlflow.pytorch.log_model(tgn_memory, 'tgn_memory')
+    torch.save(gnn.state_dict(),      MODEL_SAVE_PATH + '.gnn')
+    torch.save(node_clf.state_dict(), MODEL_SAVE_PATH + '.clf')
     logger.info(f'Model saved to {MODEL_SAVE_PATH}')
+
+    # plot training loss and val auc
+    epochs = list(range(len(train_loss_hist)))
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+
+    color_loss = '#e05c5c'
+    color_auc  = '#5c8de0'
+
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Train Loss', color=color_loss)
+    ax1.plot(epochs, train_loss_hist, color=color_loss, linewidth=2, label='Train Loss')
+    ax1.tick_params(axis='y', labelcolor=color_loss)
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('Val AUC', color=color_auc)
+    ax2.plot(epochs, val_auc_hist, color=color_auc, linewidth=2, linestyle='--', label='Val AUC')
+    ax2.tick_params(axis='y', labelcolor=color_auc)
+    ax2.set_ylim(0, 1)
+
+    # mark best epoch
+    best_ep = early_stopper.best_epoch
+    ax2.axvline(x=best_ep, color='gray', linestyle=':', linewidth=1.5, label=f'Best epoch ({best_ep})')
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
+
+    plt.title('TGN Node Classification — Training Curve')
+    plt.tight_layout()
+
+    plot_path = f'./saved_models/{args.prefix}-tgn-node-{DATA}-training-curve.png'
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    mlflow.log_artifact(plot_path)
+    logger.info(f'Training curve saved to {plot_path}')
