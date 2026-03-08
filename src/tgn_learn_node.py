@@ -320,7 +320,7 @@ def replay_memory(edge_flag=None):
     loader = TemporalDataLoader(replay_data, batch_size=BATCH_SIZE, pin_memory=True, num_workers=0)
     with torch.no_grad():
         for batch in loader:
-            batch = batch.to(device)
+            batch = batch.to(device, non_blocking=True)
             src, dst, t, m = batch.src, batch.dst, batch.t, batch.msg
             neighbor_loader.insert(src, dst)
             tgn_memory.update_state(src, dst, t.long(), m)
