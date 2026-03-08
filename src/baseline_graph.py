@@ -344,6 +344,7 @@ early_stopper    = EarlyStopMonitor(max_round=MAX_ROUND, higher_better=True, tol
 last_saved_epoch = -1
 
 train_loss_hist = []
+val_loss_hist = []
 val_auc_hist    = []
 
 mlflow.set_experiment('static-gnn-node')
@@ -391,6 +392,7 @@ with mlflow.start_run():
         }, step=epoch)
 
         train_loss_hist.append(np.mean(m_loss))
+        val_loss_hist.append(val_loss)
         val_auc_hist.append(val_auc)
 
         if early_stopper.early_stop_check(val_auc):
@@ -428,12 +430,14 @@ with mlflow.start_run():
     epochs_list = list(range(len(train_loss_hist)))
     fig, ax1 = plt.subplots(figsize=(10, 5))
 
-    color_loss = '#e05c5c'
+    color_loss_train = '#e05c5c'
+    color_loss_val   = '#e09c5c'
     color_auc  = '#5c8de0'
 
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Train Loss', color=color_loss)
     ax1.plot(epochs_list, train_loss_hist, color=color_loss, linewidth=2, label='Train Loss')
+    ax1.plot(epochs_list, val_loss_hist, color=color_loss, linewidth=2, linestyle='--', label='Val Loss')
     ax1.tick_params(axis='y', labelcolor=color_loss)
 
     ax2 = ax1.twinx()
