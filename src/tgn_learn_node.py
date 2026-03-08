@@ -370,7 +370,7 @@ train_loss_hist = []
 val_loss_hist   = []
 val_auc_hist    = []
 
-mlflow.set_experiment('tgn-node-direct')
+mlflow.set_experiment('tgn-node-clf')
 with mlflow.start_run():
     mlflow.log_params(vars(args))
 
