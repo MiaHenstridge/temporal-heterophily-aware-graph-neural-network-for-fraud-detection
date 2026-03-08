@@ -121,20 +121,20 @@ train_labels = remap_labels(train_mask)
 val_labels   = remap_labels(val_mask)
 test_labels  = remap_labels(test_mask)
 
-# background nodes (class 2 & 3) — added to train set, labeled 0 (non-fraud)
+# background nodes (class 2 & 3) — included in train set, labeled 0
 background_mask   = np.where((labels == 2) | (labels == 3))[0]
 background_nodes  = background_mask + 1  # 1-based
 background_labels = np.zeros(len(background_nodes), dtype=np.float32)
 
 # 1-based node indices — train includes background nodes
-train_nodes = np.concatenate([train_mask + 1, background_nodes])
+train_nodes  = np.concatenate([train_mask + 1, background_nodes])
 train_labels = np.concatenate([train_labels, background_labels])
-val_nodes   = val_mask  + 1
-test_nodes  = test_mask + 1
+val_nodes    = val_mask  + 1
+test_nodes   = test_mask + 1
 
 logger.info(f'Train nodes (incl. background): {len(train_nodes)}, Val nodes: {len(val_nodes)}, Test nodes: {len(test_nodes)}')
 logger.info(f'Background nodes (class 2+3): {len(background_nodes)}')
-logger.info(f'Train fraud rate: {train_labels.mean():.4f}')
+logger.info(f'Train fraud rate (excl. background): {remap_labels(train_mask).mean():.4f}')
 
 
 # edge arrays
@@ -145,10 +145,9 @@ msg   = torch.zeros(len(src_l), 1)
 
 max_idx = max(src_l.max().item(), dst_l.max().item())
 
-# fast label lookup for temporal training: node_idx -> label, -1 = unlabelled (val/test)
+# fast label lookup for temporal training: node_idx -> label, -1 = unlabelled (val/test nodes)
+# train nodes: 0 or 1, background nodes: 0, val/test nodes: -1
 train_label_arr = np.full(max_idx + 2, -1.0, dtype=np.float32)
-
-# populate label lookup — train nodes (class 0/1) and background nodes (class 2/3, labeled 0)
 train_label_arr[train_nodes] = train_labels
 
 # build 1-based node feature matrix (row 0 = padding)
@@ -158,7 +157,7 @@ node_feats[1:len(x)+1] = x
 # full TemporalData (used to replay memory state before eval)
 full_data = TemporalData(src=src_l, dst=dst_l, t=ts_l, msg=msg)
 
-# edge split flags for building separate train/val/test replay loaders
+# edge split flags — same &-based logic as original, background nodes are part of train_arr
 train_arr = torch.zeros(max_idx + 2, dtype=torch.bool)
 val_arr   = torch.zeros(max_idx + 2, dtype=torch.bool)
 test_arr  = torch.zeros(max_idx + 2, dtype=torch.bool)
@@ -166,12 +165,13 @@ train_arr[torch.tensor(train_nodes, dtype=torch.long)] = True
 val_arr  [torch.tensor(val_nodes,   dtype=torch.long)] = True
 test_arr [torch.tensor(test_nodes,  dtype=torch.long)] = True
 
-train_edge_flag = train_arr[src_l] & train_arr[dst_l]   # both src and dst in train set (no leakage)
-val_edge_flag   = val_arr[src_l]   & val_arr[dst_l]     # both src and dst in val set (no leakage)
-test_edge_flag  = test_arr[src_l]  & test_arr[dst_l]    # both src and dst in test set (no leakage)
+train_edge_flag   = train_arr[src_l] & train_arr[dst_l]
+val_edge_flag     = val_arr[src_l]   & val_arr[dst_l]
+test_edge_flag    = test_arr[src_l]  & test_arr[dst_l]
 
-nn_val_edge_flag = (train_arr[src_l] & val_arr[dst_l]) | (val_arr[src_l] & train_arr[dst_l])  # edges connecting train and val nodes (for val replay)
-nn_test_edge_flag = (train_arr[src_l] & test_arr[dst_l]) | (test_arr[src_l] & train_arr[dst_l]) | (val_arr[src_l] & test_arr[dst_l]) | (test_arr[src_l] & val_arr[dst_l])  # edges connecting test nodes to train/val nodes (for test replay)
+nn_val_edge_flag  = (train_arr[src_l] & val_arr[dst_l])  | (val_arr[src_l]  & train_arr[dst_l])
+nn_test_edge_flag = (train_arr[src_l] & test_arr[dst_l]) | (test_arr[src_l] & train_arr[dst_l]) | \
+                    (val_arr[src_l]   & test_arr[dst_l]) | (test_arr[src_l] & val_arr[dst_l])
 
 # temporal train loader — all edges in time order, labelled nodes get supervised
 train_edge_data   = full_data[train_edge_flag]
@@ -182,6 +182,10 @@ logger.info(f'Train edges: {train_edge_flag.sum()}, Val edges: {val_edge_flag.su
 
 ################## model ##################
 device = torch.device(f'cuda:{GPU}' if torch.cuda.is_available() else 'cpu')
+
+# move edge tensors to device for fast indexing in get_node_embeddings
+ts_l = ts_l.to(device)
+msg  = msg.to(device)
 
 tgn_memory = TGNMemory(
     num_nodes=max_idx + 2,
@@ -196,11 +200,13 @@ class GraphAttnEmbedding(torch.nn.Module):
     def __init__(self, in_channels, out_channels, msg_dim, time_dim, n_layers=1, dropout=0.1):
         super().__init__()
         self.time_enc = tgn_memory.time_enc
-        self.convs = torch.nn.ModuleList([
-            TransformerConv(in_channels, out_channels // 4, heads=4,
-                           dropout=dropout, edge_dim=msg_dim + time_dim)
-            for _ in range(n_layers)
-        ])
+        self.convs = torch.nn.ModuleList()
+        for i in range(n_layers):
+            in_dim = in_channels if i == 0 else out_channels
+            self.convs.append(
+                TransformerConv(in_dim, out_channels // 4, heads=4,
+                            dropout=dropout, edge_dim=msg_dim + time_dim)
+            )
         self.norms = torch.nn.ModuleList([
             torch.nn.LayerNorm(out_channels) for _ in range(n_layers)
         ])
@@ -283,8 +289,8 @@ def get_node_embeddings(nodes_tensor):
 
         if local_edge_index.size(1) > 0:
             safe_e_id = e_id_valid % len(ts_l)
-            edge_t   = ts_l[safe_e_id].to(device)
-            edge_msg = msg[safe_e_id].to(device)
+            edge_t   = ts_l[safe_e_id]
+            edge_msg = msg[safe_e_id]
             z = gnn(z, last_update, local_edge_index, edge_t, edge_msg)
 
     z_nodes = z[assoc[nodes_tensor]]
