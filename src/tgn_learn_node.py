@@ -160,15 +160,18 @@ val_arr  [torch.tensor(val_nodes,   dtype=torch.long)] = True
 test_arr [torch.tensor(test_nodes,  dtype=torch.long)] = True
 
 train_edge_flag = train_arr[src_l] & train_arr[dst_l]   # both src and dst in train set (no leakage)
-val_edge_flag   = val_arr[src_l]   | val_arr[dst_l]     # at least one endpoint in val set
-test_edge_flag  = test_arr[src_l]  | test_arr[dst_l]    # at least one endpoint in test set
+val_edge_flag   = val_arr[src_l]   & val_arr[dst_l]     # both src and dst in val set (no leakage)
+test_edge_flag  = test_arr[src_l]  & test_arr[dst_l]    # both src and dst in test set (no leakage)
+
+nn_val_edge_flag = (train_arr[src_l] & val_arr[dst_l]) | (val_arr[src_l] & train_arr[dst_l])  # edges connecting train and val nodes (for val replay)
+nn_test_edge_flag = (train_arr[src_l] & test_arr[dst_l]) | (test_arr[src_l] & train_arr[dst_l]) | (val_arr[src_l] & test_arr[dst_l]) | (test_arr[src_l] & val_arr[dst_l])  # edges connecting test nodes to train/val nodes (for test replay)
 
 # temporal train loader — all edges in time order, labelled nodes get supervised
 train_edge_data   = full_data[train_edge_flag]
 train_edge_loader = TemporalDataLoader(train_edge_data, batch_size=BATCH_SIZE)
 
 logger.info(f'Total edges: {len(src_l)}')
-logger.info(f'Train edges: {train_edge_flag.sum()}, Val edges: {val_edge_flag.sum()}, Test edges: {test_edge_flag.sum()}')
+logger.info(f'Train edges: {train_edge_flag.sum()}, Val edges: {val_edge_flag.sum() + nn_val_edge_flag.sum()}, Test edges: {test_edge_flag.sum() + nn_test_edge_flag.sum()}')
 
 ################## model ##################
 device = torch.device(f'cuda:{GPU}' if torch.cuda.is_available() else 'cpu')
@@ -326,16 +329,18 @@ def eval_node_clf(nodes, labels_np, edge_flag_for_replay):
     replay_memory(edge_flag=edge_flag_for_replay)
 
     num_instance = len(nodes)
-    all_preds, all_labels = [], []
+    all_preds, all_labels, all_losses = [], [], []
 
     for s in range(0, num_instance, BATCH_SIZE):
         e = min(num_instance, s + BATCH_SIZE)
-        node_batch  = torch.tensor(nodes[s:e],    dtype=torch.long, device=device)
-        label_batch = labels_np[s:e]
+        node_batch   = torch.tensor(nodes[s:e],    dtype=torch.long,  device=device)
+        label_batch  = labels_np[s:e]
+        label_tensor = torch.tensor(label_batch,   dtype=torch.float, device=device)
 
         z    = get_node_embeddings(node_batch)
         pred = node_clf(z).squeeze(-1)
 
+        all_losses.append(criterion(pred, label_tensor).item())
         all_preds.append(pred.cpu().numpy())
         all_labels.append(label_batch)
 
@@ -345,14 +350,15 @@ def eval_node_clf(nodes, labels_np, edge_flag_for_replay):
     scores     = torch.sigmoid(torch.tensor(all_preds)).numpy()
     pred_label = (scores > 0.5).astype(int)
 
-    auc = roc_auc_score(all_labels, scores)
-    ap  = average_precision_score(all_labels, scores)
-    f1  = f1_score(all_labels, pred_label, zero_division=0)
-    mcc = matthews_corrcoef(all_labels, pred_label)
-    rc  = recall_score(all_labels, pred_label, zero_division=0)
-    pr  = precision_score(all_labels, pred_label, zero_division=0)
+    auc      = roc_auc_score(all_labels, scores)
+    ap       = average_precision_score(all_labels, scores)
+    f1       = f1_score(all_labels, pred_label, zero_division=0)
+    mcc      = matthews_corrcoef(all_labels, pred_label)
+    rc       = recall_score(all_labels, pred_label, zero_division=0)
+    pr       = precision_score(all_labels, pred_label, zero_division=0)
+    val_loss = np.mean(all_losses)
 
-    return auc, ap, f1, mcc, rc, pr
+    return auc, ap, f1, mcc, rc, pr, val_loss
 
 
 ################## training ##################
@@ -367,6 +373,9 @@ val_auc_hist    = []
 mlflow.set_experiment('tgn-node-direct')
 with mlflow.start_run():
     mlflow.log_params(vars(args))
+
+    # precompute val replay flag — constant across epochs
+    val_replay_flag = val_edge_flag | train_edge_flag | nn_val_edge_flag # replay all train+val edges for val evaluation (no leakage)
 
     for epoch in range(NUM_EPOCH):
         tgn_memory.train()
@@ -392,7 +401,7 @@ with mlflow.start_run():
             label_vals  = train_label_arr[src_np]
             labeled_mask = label_vals >= 0
 
-            if labeled_mask.any():
+            if labeled_mask.any() and labeled_mask.sum() >= 2:
                 labeled_src    = src[torch.from_numpy(labeled_mask).to(device)]
                 label_tensor   = torch.tensor(
                     label_vals[labeled_mask], dtype=torch.float, device=device
@@ -404,7 +413,6 @@ with mlflow.start_run():
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                tgn_memory.detach()
 
                 m_loss.append(loss.item())
                 pbar.set_postfix({'loss': f'{np.mean(m_loss):.4f}'})
@@ -415,20 +423,20 @@ with mlflow.start_run():
             tgn_memory.detach()
 
         # validation — replay train+val edges so val nodes have full context
-        val_replay_flag = train_arr[src_l] | val_arr[src_l] | train_arr[dst_l] | val_arr[dst_l]
-        val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr = eval_node_clf(
+        val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, val_loss = eval_node_clf(
             val_nodes, val_labels, val_replay_flag
         )
 
         train_loss = np.mean(m_loss) if m_loss else float('nan')
         logger.info(
-            f'Epoch {epoch} | loss: {train_loss:.4f} | '
+            f'Epoch {epoch} | loss: {train_loss:.4f} | val loss: {val_loss:.4f} | '
             f'val auc: {val_auc:.4f} | val ap: {val_ap:.4f} | '
             f'val f1: {val_f1:.4f} | val mcc: {val_mcc:.4f} | '
             f'val recall: {val_rc:.4f} | val precision: {val_pr:.4f}'
         )
         mlflow.log_metrics({
             'loss':          train_loss,
+            'val_loss':      val_loss,
             'val_auc':       val_auc,
             'val_ap':        val_ap,
             'val_f1':        val_f1,
@@ -438,9 +446,10 @@ with mlflow.start_run():
         }, step=epoch)
 
         train_loss_hist.append(train_loss)
+        val_loss_hist.append(val_loss)
         val_auc_hist.append(val_auc)
 
-        if early_stopper.early_stop_check(val_ap):   # use AP — more sensitive to minority class
+        if early_stopper.early_stop_check(val_auc):   # use AUC for early stopping
             logger.info(f'Early stopping at epoch {epoch}')
             gnn.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch) + '.gnn'))
             node_clf.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch) + '.clf'))
@@ -457,8 +466,9 @@ with mlflow.start_run():
                 last_saved_epoch = epoch
 
     # final test — replay all edges for full context
-    test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr = eval_node_clf(
-        test_nodes, test_labels, edge_flag_for_replay=None
+    test_replay_flag = train_edge_flag | val_edge_flag | test_edge_flag | nn_test_edge_flag  # replay all train+val+test edges for test evaluation
+    test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, test_loss = eval_node_clf(
+        test_nodes, test_labels, edge_flag_for_replay=test_replay_flag
     )
     logger.info(
         f'Test | auc: {test_auc:.4f} | ap: {test_ap:.4f} | '
@@ -472,6 +482,7 @@ with mlflow.start_run():
         'test_mcc':       test_mcc,
         'test_recall':    test_rc,
         'test_precision': test_pr,
+        'test_loss':      test_loss,
     })
 
     torch.save(gnn.state_dict(),      MODEL_SAVE_PATH + '.gnn')
@@ -486,8 +497,9 @@ with mlflow.start_run():
     color_auc  = '#5c8de0'
 
     ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Train Loss', color=color_loss)
+    ax1.set_ylabel('Loss', color=color_loss)
     ax1.plot(epochs, train_loss_hist, color=color_loss, linewidth=2, label='Train Loss')
+    ax1.plot(epochs, val_loss_hist,   color='#e0a85c',  linewidth=2, linestyle='--', label='Val Loss')
     ax1.tick_params(axis='y', labelcolor=color_loss)
 
     ax2 = ax1.twinx()
