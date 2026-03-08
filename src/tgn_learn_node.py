@@ -58,6 +58,8 @@ parser.add_argument('--prefix',          type=str,   default='')
 parser.add_argument('--tune',            action='store_true')
 parser.add_argument('--max_round',       type=int,   default=5)
 parser.add_argument('--tolerance',       type=float, default=1e-4)
+parser.add_argument('--pos_weight',      type=float, default=-1,
+                    help='positive class weight for BCE loss. -1 = auto (n_neg/n_pos)')
 
 try:
     args = parser.parse_args()
@@ -78,6 +80,7 @@ NUM_NEIGHBOR  = args.n_neighbor
 NUM_LAYER     = args.n_layer
 MAX_ROUND     = args.max_round
 TOLERANCE     = args.tolerance
+POS_WEIGHT    = args.pos_weight
 
 MODEL_SAVE_PATH = f'./saved_models/{args.prefix}-tgn-node-{DATA}.pth'
 get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{args.prefix}-tgn-node-{DATA}-{epoch}.pth'
@@ -126,6 +129,7 @@ test_nodes  = test_mask  + 1
 logger.info(f'Train nodes: {len(train_nodes)}, Val nodes: {len(val_nodes)}, Test nodes: {len(test_nodes)}')
 logger.info(f'Train fraud rate: {train_labels.mean():.4f}')
 
+
 # edge arrays
 src_l = torch.tensor(g_df.u.values,   dtype=torch.long)
 dst_l = torch.tensor(g_df.i.values,   dtype=torch.long)
@@ -133,6 +137,12 @@ ts_l  = torch.tensor(g_df.ts.values,  dtype=torch.long)
 msg   = torch.zeros(len(src_l), 1)
 
 max_idx = max(src_l.max().item(), dst_l.max().item())
+
+# fast label lookup for temporal training: node_idx -> label, -1 = no label
+train_label_arr = np.full(max_idx + 2, -1.0, dtype=np.float32)
+
+# populate label lookup
+train_label_arr[train_nodes] = train_labels
 
 # build 1-based node feature matrix (row 0 = padding)
 node_feats = np.zeros((max_idx + 2, node_feat_dim), dtype=np.float32)
@@ -149,9 +159,13 @@ train_arr[torch.tensor(train_nodes, dtype=torch.long)] = True
 val_arr  [torch.tensor(val_nodes,   dtype=torch.long)] = True
 test_arr [torch.tensor(test_nodes,  dtype=torch.long)] = True
 
-train_edge_flag = train_arr[src_l] & train_arr[dst_l]
-val_edge_flag   = val_arr[src_l]   & val_arr[dst_l]
-test_edge_flag  = test_arr[src_l]  & test_arr[dst_l]
+train_edge_flag = train_arr[src_l] & train_arr[dst_l]   # both src and dst in train set (no leakage)
+val_edge_flag   = val_arr[src_l]   | val_arr[dst_l]     # at least one endpoint in val set
+test_edge_flag  = test_arr[src_l]  | test_arr[dst_l]    # at least one endpoint in test set
+
+# temporal train loader — all edges in time order, labelled nodes get supervised
+train_edge_data   = full_data[train_edge_flag]
+train_edge_loader = TemporalDataLoader(train_edge_data, batch_size=BATCH_SIZE)
 
 logger.info(f'Total edges: {len(src_l)}')
 logger.info(f'Train edges: {train_edge_flag.sum()}, Val edges: {val_edge_flag.sum()}, Test edges: {test_edge_flag.sum()}')
@@ -198,9 +212,15 @@ gnn = GraphAttnEmbedding(
     dropout=DROP_OUT,
 ).to(device)
 
-# node classifier head
+# node classifier head — takes GNN embedding + raw node features as skip connection
+clf_input_dim = NODE_DIM + node_feat_dim
 node_clf = torch.nn.Sequential(
+    torch.nn.Linear(clf_input_dim, NODE_DIM),
+    torch.nn.BatchNorm1d(NODE_DIM),
+    torch.nn.ReLU(),
+    torch.nn.Dropout(DROP_OUT),
     torch.nn.Linear(NODE_DIM, NODE_DIM // 2),
+    torch.nn.BatchNorm1d(NODE_DIM // 2),
     torch.nn.ReLU(),
     torch.nn.Dropout(DROP_OUT),
     torch.nn.Linear(NODE_DIM // 2, 1),
@@ -212,10 +232,15 @@ neighbor_loader = LastNeighborLoader(max_idx + 2, size=NUM_NEIGHBOR, device=devi
 node_feats_th  = torch.tensor(node_feats, dtype=torch.float).to(device)
 node_feat_proj = torch.nn.Linear(node_feat_dim, MEMORY_DIM).to(device)
 
-# pos_weight for class imbalance (fraud rate is ~1%)
+# pos_weight for class imbalance
 n_neg = (train_labels == 0).sum()
 n_pos = (train_labels == 1).sum()
-pos_weight = torch.tensor([n_neg / n_pos], dtype=torch.float).to(device)
+if POS_WEIGHT > 0:
+    pw = POS_WEIGHT
+else:
+    pw = n_neg / n_pos   # auto
+    logger.info(f'Auto pos_weight: {pw:.2f} (n_neg={n_neg}, n_pos={n_pos})')
+pos_weight = torch.tensor([pw], dtype=torch.float).to(device)
 criterion  = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
 optimizer = torch.optim.Adam(
@@ -228,8 +253,9 @@ optimizer = torch.optim.Adam(
 def get_node_embeddings(nodes_tensor):
     """
     Compute embeddings for a batch of nodes using current memory state.
+    Returns concatenation of GNN embedding and raw node features.
     nodes_tensor: 1D LongTensor of global node ids (1-based).
-    Returns: (N, NODE_DIM) embedding tensor.
+    Returns: (N, NODE_DIM + node_feat_dim) tensor.
     """
     n_id, edge_index, e_id = neighbor_loader(nodes_tensor)
 
@@ -246,13 +272,16 @@ def get_node_embeddings(nodes_tensor):
         e_id_valid = e_id[valid_mask]
 
         if local_edge_index.size(1) > 0:
-            # e_id references the global edge list — use ts_l and msg directly
             safe_e_id = e_id_valid % len(ts_l)
             edge_t   = ts_l[safe_e_id].to(device)
             edge_msg = msg[safe_e_id].to(device)
             z = gnn(z, last_update, local_edge_index, edge_t, edge_msg)
 
-    return z[assoc[nodes_tensor]]
+    z_nodes = z[assoc[nodes_tensor]]
+
+    # skip connection: concatenate raw node features
+    raw_feats = node_feats_th[nodes_tensor]
+    return torch.cat([z_nodes, raw_feats], dim=-1)
 
 
 ################## replay memory: warm up state from edge stream ##################
@@ -332,62 +361,74 @@ last_saved_epoch = -1  # track which epoch was last checkpointed
 
 # history for plotting
 train_loss_hist = []
+val_loss_hist   = []
 val_auc_hist    = []
 
 mlflow.set_experiment('tgn-node-direct')
 with mlflow.start_run():
     mlflow.log_params(vars(args))
 
-    # shuffle train node indices once
-    train_idx = np.arange(len(train_nodes))
-
     for epoch in range(NUM_EPOCH):
         tgn_memory.train()
         gnn.train()
         node_clf.train()
 
-        # reset and warm up memory on train edges before each epoch
-        replay_memory(edge_flag=train_edge_flag)
+        # reset memory at start of each epoch
+        tgn_memory.reset_state()
+        neighbor_loader.reset_state()
+        with torch.no_grad():
+            tgn_memory.memory.data = node_feat_proj(node_feats_th)
         tgn_memory.train()
-        gnn.train()
-        node_clf.train()
 
-        np.random.shuffle(train_idx)
         m_loss = []
-        pbar = tqdm(range(0, len(train_nodes), BATCH_SIZE), desc=f'Epoch {epoch}')
+        pbar = tqdm(train_edge_loader, desc=f'Epoch {epoch}')
 
-        for s in pbar:
-            e = min(len(train_nodes), s + BATCH_SIZE)
-            batch_idx   = train_idx[s:e]
-            node_batch  = torch.tensor(train_nodes[batch_idx], dtype=torch.long, device=device)
-            label_batch = torch.tensor(train_labels[batch_idx], dtype=torch.float, device=device)
+        for batch in pbar:
+            batch = batch.to(device)
+            src, dst, t, m = batch.src, batch.dst, batch.t, batch.msg
 
-            z    = get_node_embeddings(node_batch)
-            pred = node_clf(z).squeeze(-1)
-            loss = criterion(pred, label_batch)
+            # find which src nodes in this batch have train labels
+            src_np      = src.cpu().numpy()
+            label_vals  = train_label_arr[src_np]
+            labeled_mask = label_vals >= 0
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            if labeled_mask.any():
+                labeled_src    = src[torch.from_numpy(labeled_mask).to(device)]
+                label_tensor   = torch.tensor(
+                    label_vals[labeled_mask], dtype=torch.float, device=device
+                )
+                z    = get_node_embeddings(labeled_src)
+                pred = node_clf(z).squeeze(-1)
+                loss = criterion(pred, label_tensor)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                tgn_memory.detach()
+
+                m_loss.append(loss.item())
+                pbar.set_postfix({'loss': f'{np.mean(m_loss):.4f}'})
+
+            # update memory with current batch edges (after classification)
+            neighbor_loader.insert(src, dst)
+            tgn_memory.update_state(src, dst, t.long(), m)
             tgn_memory.detach()
 
-            m_loss.append(loss.item())
-            pbar.set_postfix({'loss': f'{np.mean(m_loss):.4f}'})
-
         # validation — replay train+val edges so val nodes have full context
-        val_replay_flag = train_edge_flag | val_edge_flag
+        val_replay_flag = train_arr[src_l] | val_arr[src_l] | train_arr[dst_l] | val_arr[dst_l]
         val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr = eval_node_clf(
             val_nodes, val_labels, val_replay_flag
         )
 
+        train_loss = np.mean(m_loss) if m_loss else float('nan')
         logger.info(
-            f'Epoch {epoch} | loss: {np.mean(m_loss):.4f} | '
+            f'Epoch {epoch} | loss: {train_loss:.4f} | '
             f'val auc: {val_auc:.4f} | val ap: {val_ap:.4f} | '
             f'val f1: {val_f1:.4f} | val mcc: {val_mcc:.4f} | '
             f'val recall: {val_rc:.4f} | val precision: {val_pr:.4f}'
         )
         mlflow.log_metrics({
-            'loss':          np.mean(m_loss),
+            'loss':          train_loss,
             'val_auc':       val_auc,
             'val_ap':        val_ap,
             'val_f1':        val_f1,
@@ -396,10 +437,10 @@ with mlflow.start_run():
             'val_precision': val_pr,
         }, step=epoch)
 
-        train_loss_hist.append(np.mean(m_loss))
+        train_loss_hist.append(train_loss)
         val_auc_hist.append(val_auc)
 
-        if early_stopper.early_stop_check(val_auc):
+        if early_stopper.early_stop_check(val_ap):   # use AP — more sensitive to minority class
             logger.info(f'Early stopping at epoch {epoch}')
             gnn.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch) + '.gnn'))
             node_clf.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch) + '.clf'))
@@ -463,7 +504,7 @@ with mlflow.start_run():
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
 
-    plt.title('TGN Node Classification — Training Curve')
+    plt.title('TGN Node Classification — Training Curve (early stop on val AP)')
     plt.tight_layout()
 
     plot_path = f'./saved_models/{args.prefix}-tgn-node-{DATA}-training-curve.png'
