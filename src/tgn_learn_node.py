@@ -317,7 +317,7 @@ def replay_memory(edge_flag=None):
     else:
         replay_data = full_data[edge_flag]
 
-    loader = TemporalDataLoader(replay_data, batch_size=BATCH_SIZE)
+    loader = TemporalDataLoader(replay_data, batch_size=BATCH_SIZE, pin_memory=True, num_workers=0)
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
