@@ -388,7 +388,7 @@ with mlflow.start_run():
     mlflow.log_params(vars(args))
 
     # precompute val replay flag — constant across epochs
-    val_replay_flag = val_edge_flag | train_edge_flag | nn_val_edge_flag # replay all train+val edges for val evaluation (no leakage)
+    val_replay_flag = val_edge_flag | nn_val_edge_flag # replay all val edges for val evaluation (no leakage)
 
     for epoch in range(NUM_EPOCH):
         tgn_memory.train()
@@ -479,7 +479,7 @@ with mlflow.start_run():
                 last_saved_epoch = epoch
 
     # final test — replay all edges for full context
-    test_replay_flag = train_edge_flag | val_edge_flag | nn_val_edge_flag | test_edge_flag | nn_test_edge_flag  # replay all train+val+test edges for test evaluation
+    test_replay_flag = test_edge_flag | nn_test_edge_flag  # replay all train+val+test edges for test evaluation
     test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, test_loss = eval_node_clf(
         test_nodes, test_labels, edge_flag_for_replay=test_replay_flag
     )
