@@ -121,12 +121,19 @@ train_labels = remap_labels(train_mask)
 val_labels   = remap_labels(val_mask)
 test_labels  = remap_labels(test_mask)
 
-# 1-based node indices
-train_nodes = train_mask + 1
-val_nodes   = val_mask   + 1
-test_nodes  = test_mask  + 1
+# background nodes (class 2 & 3) — added to train set, labeled 0 (non-fraud)
+background_mask   = np.where((labels == 2) | (labels == 3))[0]
+background_nodes  = background_mask + 1  # 1-based
+background_labels = np.zeros(len(background_nodes), dtype=np.float32)
 
-logger.info(f'Train nodes: {len(train_nodes)}, Val nodes: {len(val_nodes)}, Test nodes: {len(test_nodes)}')
+# 1-based node indices — train includes background nodes
+train_nodes = np.concatenate([train_mask + 1, background_nodes])
+train_labels = np.concatenate([train_labels, background_labels])
+val_nodes   = val_mask  + 1
+test_nodes  = test_mask + 1
+
+logger.info(f'Train nodes (incl. background): {len(train_nodes)}, Val nodes: {len(val_nodes)}, Test nodes: {len(test_nodes)}')
+logger.info(f'Background nodes (class 2+3): {len(background_nodes)}')
 logger.info(f'Train fraud rate: {train_labels.mean():.4f}')
 
 
@@ -138,10 +145,10 @@ msg   = torch.zeros(len(src_l), 1)
 
 max_idx = max(src_l.max().item(), dst_l.max().item())
 
-# fast label lookup for temporal training: node_idx -> label, -1 = no label
+# fast label lookup for temporal training: node_idx -> label, -1 = unlabelled (val/test)
 train_label_arr = np.full(max_idx + 2, -1.0, dtype=np.float32)
 
-# populate label lookup
+# populate label lookup — train nodes (class 0/1) and background nodes (class 2/3, labeled 0)
 train_label_arr[train_nodes] = train_labels
 
 # build 1-based node feature matrix (row 0 = padding)
