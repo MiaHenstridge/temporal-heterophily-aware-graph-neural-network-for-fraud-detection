@@ -17,9 +17,8 @@ from sklearn.metrics import (
     precision_score,
 )
 
-from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
-from torch_geometric.nn import SAGEConv, GATConv
+from torch_geometric.nn import SAGEConv, GATConv, GATv2Conv
 
 import mlflow
 import matplotlib
@@ -27,6 +26,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from utils import EarlyStopMonitor
 from namespaces import DA
+from dgraphfin import load_dgraphfin
 
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.makedirs(DA.paths.log, exist_ok=True)
@@ -34,10 +34,13 @@ os.makedirs('./saved_models', exist_ok=True)
 os.makedirs('./saved_checkpoints', exist_ok=True)
 
 ################## argument parser ##################
-parser = argparse.ArgumentParser('Static GNN Node Classification (GraphSAGE / GAT)')
-parser.add_argument('-d', '--data',      type=str,   default='dgraphfin')
-parser.add_argument('--model',           type=str,   default='sage', choices=['sage', 'gat'],
-                    help='sage = GraphSAGE, gat = GAT')
+parser = argparse.ArgumentParser('Static GNN Node Classification (GraphSAGE / GAT / GATv2)')
+parser.add_argument('-d', '--data',      type=str,   default='DGraphFin')
+parser.add_argument('--data_dir',        type=str,   default='./datasets',
+                    help='root directory containing raw/dgraphfin.npz')
+parser.add_argument('--model',           type=str,   default='sage',
+                    choices=['sage', 'gat', 'gatv2'],
+                    help='sage = GraphSAGE, gat = GAT, gatv2 = GATv2')
 parser.add_argument('--bs',              type=int,   default=1024,
                     help='number of seed nodes per mini-batch')
 parser.add_argument('--n_epoch',         type=int,   default=10)
@@ -47,15 +50,17 @@ parser.add_argument('--gpu',             type=int,   default=0)
 parser.add_argument('--n_layer',         type=int,   default=2)
 parser.add_argument('--node_dim',        type=int,   default=128)
 parser.add_argument('--heads',           type=int,   default=4,
-                    help='number of attention heads (GAT only)')
+                    help='number of attention heads (GAT / GATv2 only)')
 parser.add_argument('--n_neighbor',      type=int,   default=10,
                     help='neighbors sampled per layer in NeighborLoader')
+parser.add_argument('--fold',            type=int,   default=0,
+                    help='which fold to use when dataset has multiple splits')
 parser.add_argument('--prefix',          type=str,   default='')
 parser.add_argument('--max_round',       type=int,   default=10)
 parser.add_argument('--tolerance',       type=float, default=1e-4)
 parser.add_argument('--pos_weight',      type=float, default=100,
                     help='positive class weight for BCE loss. -1 = auto (n_neg/n_pos)')
-parser.add_argument('--num_workers',     type=int,   default=12,)
+parser.add_argument('--num_workers',     type=int,   default=12)
 parser.add_argument('--weight_decay',    type=float, default=5e-7)
 
 try:
@@ -80,7 +85,7 @@ NUM_WORKERS   = args.num_workers
 WEIGHT_DECAY  = args.weight_decay
 
 MODEL_SAVE_PATH     = f'./saved_models/{args.prefix}-{MODEL_TYPE}-node-{DATA}.pth'
-get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{args.prefix}-{MODEL_TYPE}-node-{DATA}-{epoch}.pth'
+get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{args.prefix}-{MODEL_TYPE}-node-{DATA}-{epoch}'
 
 ################## logger ##################
 logging.basicConfig(level=logging.INFO)
@@ -97,115 +102,69 @@ logger.addHandler(fh)
 logger.addHandler(ch)
 logger.info(args)
 
-################## load data ##################
-raw = np.load(os.path.join(DA.paths.data, 'dgraphfin.npz'))
+################## load & process data ##################
+bundle = load_dgraphfin(data_dir=args.data_dir, fold=args.fold)
 
-train_mask = raw['train_mask']
-val_mask   = raw['valid_mask']
-test_mask  = raw['test_mask']
-labels     = raw['y']
-x          = raw['x']           # (3700550, 17)
-edge_index = raw['edge_index']  # shape may be (N,2) or (2,N)
+graph         = bundle.graph
+train_idx     = bundle.train_idx
+val_idx       = bundle.val_idx
+test_idx      = bundle.test_idx
+train_labels_np = bundle.train_labels
+node_feat_dim = bundle.node_feat_dim
 
-node_feat_dim = x.shape[1]
-
-# remap labels: class 1 = fraud, everything else = 0
-def remap_labels(mask):
-    return (labels[mask] == 1).astype(np.float32)
-
-train_labels_base = remap_labels(train_mask)
-val_labels        = remap_labels(val_mask)
-test_labels       = remap_labels(test_mask)
-
-# ── Node splitting logic (identical to tgn_learn_node.py) ──────────────────
-# background nodes (class 2 & 3) included in train, labelled 0
-background_mask   = np.where((labels == 2) | (labels == 3))[0]
-background_nodes  = background_mask + 1          # 1-based
-background_labels = np.zeros(len(background_nodes), dtype=np.float32)
-
-# 1-based node indices
-train_nodes_base = train_mask + 1
-val_nodes        = val_mask   + 1
-test_nodes       = test_mask  + 1
-
-# train includes background nodes
-train_nodes  = np.concatenate([train_nodes_base, background_nodes])
-train_labels = np.concatenate([train_labels_base, background_labels])
-
-logger.info(f'Train nodes (incl background): {len(train_nodes)}')
-logger.info(f'Val nodes: {len(val_nodes)}, Test nodes: {len(test_nodes)}')
-logger.info(f'Train fraud rate: {(train_labels == 1).mean():.4f}')
-
-# ── Build PyG graph ───────────────────────────────────────────────────────
-# DGraphFin edge_index may be (N,2) — transpose to (2,N)
-ei = torch.tensor(edge_index, dtype=torch.long)
-if ei.shape[0] != 2:
-    ei = ei.t().contiguous()
-
-# build 1-based node feature matrix (row 0 = padding/dummy)
-max_node_idx  = int(ei.max().item())
-num_nodes     = max_node_idx + 2
-node_feats    = np.zeros((num_nodes, node_feat_dim), dtype=np.float32)
-node_feats[1:len(x)+1] = x
-node_feats_th = torch.tensor(node_feats, dtype=torch.float)
-
-# undirected graph: add reverse edges
-ei_full = torch.cat([ei, ei.flip(0)], dim=1)
-
-# full-graph label tensor (-1 = unlabelled) — used inside NeighborLoader batches
-y_full = torch.full((num_nodes,), -1.0, dtype=torch.float)
-y_full[torch.tensor(train_nodes, dtype=torch.long)] = torch.tensor(train_labels, dtype=torch.float)
-y_full[torch.tensor(val_nodes,   dtype=torch.long)] = torch.tensor(val_labels,   dtype=torch.float)
-y_full[torch.tensor(test_nodes,  dtype=torch.long)] = torch.tensor(test_labels,  dtype=torch.float)
-
-# graph stays on CPU — NeighborLoader transfers each mini-batch to GPU
-graph = Data(x=node_feats_th, edge_index=ei_full, y=y_full, num_nodes=num_nodes)
-
-logger.info(f'Graph: {graph.num_nodes} nodes, {graph.num_edges} edges')
+logger.info(f'Train nodes: {len(train_idx)} | Val nodes: {len(val_idx)} | Test nodes: {len(test_idx)}')
+logger.info(f'Train fraud rate: {train_labels_np.mean():.4f}')
+logger.info(f'Graph: {graph.num_nodes} nodes | {graph.num_edges} edges')
 
 ################## device ##################
 device = torch.device(f'cuda:{GPU}' if torch.cuda.is_available() else 'cpu')
 
 ################## NeighborLoaders ##################
-# num_neighbors: sample NUM_NEIGHBOR neighbors per hop, listed outer->inner
-# e.g. n_layer=2, n_neighbor=10 -> sample 10 neighbors at hop-2, then 10 at hop-1
-num_neighbors = [NUM_NEIGHBOR] * NUM_LAYER
+# The reference repo uses sizes=[10, 5] for a 2-layer model.
+# We generalise: for 2 layers → [n_neighbor, 5]; otherwise a linearly
+# decreasing schedule from n_neighbor down to 5.
+if NUM_LAYER == 1:
+    num_neighbors = [NUM_NEIGHBOR]
+elif NUM_LAYER == 2:
+    num_neighbors = [NUM_NEIGHBOR, 5]
+else:
+    step = max(1, (NUM_NEIGHBOR - 5) // (NUM_LAYER - 1))
+    num_neighbors = [max(5, NUM_NEIGHBOR - i * step) for i in range(NUM_LAYER)]
+
+logger.info(f'NeighborLoader fanouts (outer→inner): {num_neighbors}')
 
 train_loader = NeighborLoader(
     graph,
-    num_neighbors=num_neighbors,
-    batch_size=BATCH_SIZE,
-    input_nodes=torch.tensor(train_nodes, dtype=torch.long),
-    shuffle=True,
-    num_workers=NUM_WORKERS,
-    # pin_memory=True,
+    num_neighbors = num_neighbors,
+    batch_size    = BATCH_SIZE,
+    input_nodes   = train_idx,
+    shuffle       = True,
+    num_workers   = NUM_WORKERS,
 )
 
 val_loader = NeighborLoader(
     graph,
-    num_neighbors=num_neighbors,
-    batch_size=BATCH_SIZE * 2,      # no grad — can use larger batch
-    input_nodes=torch.tensor(val_nodes, dtype=torch.long),
-    shuffle=False,
-    num_workers=NUM_WORKERS,
-    # pin_memory=True,
+    num_neighbors = num_neighbors,
+    batch_size    = BATCH_SIZE * 2,
+    input_nodes   = val_idx,
+    shuffle       = False,
+    num_workers   = NUM_WORKERS,
 )
 
 test_loader = NeighborLoader(
     graph,
-    num_neighbors=num_neighbors,
-    batch_size=BATCH_SIZE * 2,
-    input_nodes=torch.tensor(test_nodes, dtype=torch.long),
-    shuffle=False,
-    num_workers=NUM_WORKERS,
-    # pin_memory=True,
+    num_neighbors = num_neighbors,
+    batch_size    = BATCH_SIZE * 2,
+    input_nodes   = test_idx,
+    shuffle       = False,
+    num_workers   = NUM_WORKERS,
 )
 
-################## model ##################
-# In NeighborLoader mini-batch training, the subgraph returned for each batch
-# contains seed nodes + their sampled neighbors. Seed nodes are always placed
-# first (indices 0..batch_size-1). We run the full GNN on the subgraph and
-# only classify the seed nodes at the end.
+################## model definitions ##################
+# In NeighborLoader mini-batch training the subgraph for each batch contains
+# seed nodes + their sampled neighbours. Seed nodes are always placed first
+# (indices 0..batch_size-1). The full GNN runs on the subgraph; only seed
+# nodes are classified.
 
 class GraphSAGEModel(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, n_layers, dropout):
@@ -220,7 +179,6 @@ class GraphSAGEModel(torch.nn.Module):
             self.convs.append(SAGEConv(hidden_channels, hidden_channels))
             self.norms.append(torch.nn.BatchNorm1d(hidden_channels))
 
-        # MLP classifier on embedding
         self.clf = torch.nn.Sequential(
             torch.nn.Linear(hidden_channels, hidden_channels),
             torch.nn.BatchNorm1d(hidden_channels),
@@ -238,7 +196,6 @@ class GraphSAGEModel(torch.nn.Module):
         for conv, norm in zip(self.convs, self.norms):
             h = norm(conv(h, edge_index).relu())
             h = F.dropout(h, p=self.dropout, training=self.training)
-        # slice to seed nodes only
         return self.clf(h[:batch_size]).squeeze(-1)
 
 
@@ -277,27 +234,70 @@ class GATModel(torch.nn.Module):
         return self.clf(h[:batch_size]).squeeze(-1)
 
 
+class GATv2Model(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, n_layers, heads, dropout):
+        super().__init__()
+        self.convs   = torch.nn.ModuleList()
+        self.norms   = torch.nn.ModuleList()
+        self.dropout = dropout
+
+        self.convs.append(GATv2Conv(in_channels, hidden_channels // heads,
+                                     heads=heads, dropout=dropout, concat=True))
+        self.norms.append(torch.nn.BatchNorm1d(hidden_channels))
+        for _ in range(n_layers - 1):
+            self.convs.append(GATv2Conv(hidden_channels, hidden_channels // heads,
+                                         heads=heads, dropout=dropout, concat=True))
+            self.norms.append(torch.nn.BatchNorm1d(hidden_channels))
+
+        self.clf = torch.nn.Sequential(
+            torch.nn.Linear(hidden_channels, hidden_channels),
+            torch.nn.BatchNorm1d(hidden_channels),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_channels, hidden_channels // 2),
+            torch.nn.BatchNorm1d(hidden_channels // 2),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_channels // 2, 1),
+        )
+
+    def forward(self, x, edge_index, batch_size):
+        h = x
+        for conv, norm in zip(self.convs, self.norms):
+            h = norm(conv(h, edge_index).relu())
+            h = F.dropout(h, p=self.dropout, training=self.training)
+        return self.clf(h[:batch_size]).squeeze(-1)
+
+
 if MODEL_TYPE == 'sage':
     model = GraphSAGEModel(
-        in_channels=node_feat_dim,
-        hidden_channels=NODE_DIM,
-        n_layers=NUM_LAYER,
-        dropout=DROP_OUT,
+        in_channels     = node_feat_dim,
+        hidden_channels = NODE_DIM,
+        n_layers        = NUM_LAYER,
+        dropout         = DROP_OUT,
     ).to(device)
-else:
+elif MODEL_TYPE == 'gat':
     model = GATModel(
-        in_channels=node_feat_dim,
-        hidden_channels=NODE_DIM,
-        n_layers=NUM_LAYER,
-        heads=args.heads,
-        dropout=DROP_OUT,
+        in_channels     = node_feat_dim,
+        hidden_channels = NODE_DIM,
+        n_layers        = NUM_LAYER,
+        heads           = args.heads,
+        dropout         = DROP_OUT,
+    ).to(device)
+else:  # gatv2
+    model = GATv2Model(
+        in_channels     = node_feat_dim,
+        hidden_channels = NODE_DIM,
+        n_layers        = NUM_LAYER,
+        heads           = args.heads,
+        dropout         = DROP_OUT,
     ).to(device)
 
 logger.info(f'Model: {MODEL_TYPE.upper()} | params: {sum(p.numel() for p in model.parameters()):,}')
 
 ################## loss / optimiser ##################
-n_neg = (train_labels == 0).sum()
-n_pos = (train_labels == 1).sum()
+n_neg = (train_labels_np == 0).sum()
+n_pos = (train_labels_np == 1).sum()
 pw    = float(n_neg) / float(n_pos) if args.pos_weight < 0 else args.pos_weight
 logger.info(f'pos_weight: {pw:.2f}')
 
@@ -316,7 +316,7 @@ def eval_nodes(loader):
 
     for batch in loader:
         batch      = batch.to(device, non_blocking=True)
-        batch_size = batch.batch_size   # seed nodes = first batch_size rows
+        batch_size = batch.batch_size
 
         pred         = model(batch.x, batch.edge_index, batch_size)
         labels_batch = batch.y[:batch_size]
@@ -348,10 +348,10 @@ early_stopper    = EarlyStopMonitor(max_round=MAX_ROUND, higher_better=False, to
 last_saved_epoch = -1
 
 train_loss_hist = []
-val_loss_hist = []
+val_loss_hist   = []
 val_auc_hist    = []
 
-mlflow.set_experiment('static-gnn-node')
+mlflow.set_experiment(f'static-gnn-{MODEL_TYPE}')
 with mlflow.start_run():
     mlflow.log_params(vars(args))
 
@@ -362,7 +362,7 @@ with mlflow.start_run():
         pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
         for batch in pbar:
             batch      = batch.to(device, non_blocking=True)
-            batch_size = batch.batch_size   # seed nodes are always the first batch_size rows
+            batch_size = batch.batch_size
 
             pred        = model(batch.x, batch.edge_index, batch_size)
             label_batch = batch.y[:batch_size]
@@ -411,7 +411,7 @@ with mlflow.start_run():
                 torch.save(model.state_dict(), get_checkpoint_path(epoch) + '.pt')
                 last_saved_epoch = epoch
 
-    # final test
+    # ── final test ──────────────────────────────────────────────────────────
     test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, test_loss = eval_nodes(test_loader)
     logger.info(
         f'Test | auc: {test_auc:.4f} | ap: {test_ap:.4f} | '
@@ -430,18 +430,18 @@ with mlflow.start_run():
     torch.save(model.state_dict(), MODEL_SAVE_PATH)
     logger.info(f'Model saved to {MODEL_SAVE_PATH}')
 
-    # plot
+    # ── training curve plot ─────────────────────────────────────────────────
     epochs_list = list(range(len(train_loss_hist)))
     fig, ax1 = plt.subplots(figsize=(10, 5))
 
     color_loss_train = '#e05c5c'
     color_loss_val   = '#e09c5c'
-    color_auc  = '#5c8de0'
+    color_auc        = '#5c8de0'
 
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Train Loss', color=color_loss_train)
     ax1.plot(epochs_list, train_loss_hist, color=color_loss_train, linewidth=2, label='Train Loss')
-    ax1.plot(epochs_list, val_loss_hist, color=color_loss_val, linewidth=2, linestyle='--', label='Val Loss')
+    ax1.plot(epochs_list, val_loss_hist,   color=color_loss_val,   linewidth=2, linestyle='--', label='Val Loss')
     ax1.tick_params(axis='y', labelcolor=color_loss_train)
 
     ax2 = ax1.twinx()
@@ -457,7 +457,7 @@ with mlflow.start_run():
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
 
-    plt.title(f'{MODEL_TYPE.upper()} Node Classification — Training Curve (early stop on val AUC)')
+    plt.title(f'{MODEL_TYPE.upper()} Node Classification — Training Curve (early stop on val loss)')
     plt.tight_layout()
 
     plot_path = f'./saved_models/{args.prefix}-{MODEL_TYPE}-node-{DATA}-training-curve.png'
