@@ -62,6 +62,7 @@ parser.add_argument('--pos_weight',      type=float, default=100,
                     help='positive class weight for BCE loss. -1 = auto (n_neg/n_pos)')
 parser.add_argument('--num_workers',     type=int,   default=12)
 parser.add_argument('--weight_decay',    type=float, default=5e-7)
+parser.add_argument('--early_stop_higher_better', action='store_false')
 
 try:
     args = parser.parse_args()
@@ -83,9 +84,10 @@ TOLERANCE     = args.tolerance
 MODEL_TYPE    = args.model
 NUM_WORKERS   = args.num_workers
 WEIGHT_DECAY  = args.weight_decay
+EARLY_STOP_HIGHER_BETTER = args.early_stop_higher_better
 
-MODEL_SAVE_PATH     = f'./saved_models/{args.prefix}-{MODEL_TYPE}-node-{DATA}.pth'
-get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{args.prefix}-{MODEL_TYPE}-node-{DATA}-{epoch}'
+MODEL_SAVE_PATH     = f'./saved_models/{MODEL_TYPE}-{args.prefix}-node-{DATA}.pth'
+get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{MODEL_TYPE}-{args.prefix}-node-{DATA}-{epoch}'
 
 ################## logger ##################
 logging.basicConfig(level=logging.INFO)
@@ -344,7 +346,7 @@ def eval_nodes(loader):
     return auc, ap, f1, mcc, rc, pr, val_loss
 
 ################## training ##################
-early_stopper    = EarlyStopMonitor(max_round=MAX_ROUND, higher_better=False, tolerance=TOLERANCE)
+early_stopper    = EarlyStopMonitor(max_round=MAX_ROUND, higher_better=EARLY_STOP_HIGHER_BETTER, tolerance=TOLERANCE)
 last_saved_epoch = -1
 
 train_loss_hist = []
@@ -399,7 +401,7 @@ with mlflow.start_run():
         val_loss_hist.append(val_loss)
         val_auc_hist.append(val_auc)
 
-        if early_stopper.early_stop_check(val_loss):
+        if early_stopper.early_stop_check(val_loss, ):
             logger.info(f'Early stopping at epoch {epoch}')
             model.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch) + '.pt'))
             break

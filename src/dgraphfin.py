@@ -15,7 +15,7 @@ Dataset layout
     datasets/
         DGraphFin/            ← place dgraphfin.npz here
     processed_data/      
-        graph                 ← created automatically on first run
+        graph/data.pt         ← created automatically on first run
 
 Node-label convention (from the official README)
 -------------------------------------------------
@@ -69,7 +69,7 @@ class DGraphFin(InMemoryDataset):
     """
     PyG :class:`~torch_geometric.data.InMemoryDataset` that reads
     ``dgraphfin.npz`` from ``datasets/DGraphFin/`` and persists the processed
-    graph to ``processed_data/graph``.
+    graph to ``processed_data/graph/data.pt``.
 
     On the **first** run :meth:`process` is called automatically; subsequent
     runs skip straight to loading the cached ``.pt`` file.
@@ -131,7 +131,7 @@ class DGraphFin(InMemoryDataset):
 
     @property
     def processed_file_names(self):
-        return ['graph']
+        return ['graph/data.pt']
 
     def download(self) -> None:
         # No automatic download – the file must already be present at
@@ -187,7 +187,7 @@ def load_dgraphfin(data_dir: str, fold: int = 0) -> DGraphFinBundle:
     Processing pipeline
     -------------------
     1. **Load** via :class:`DGraphFin` (``T.ToSparseTensor()`` applied once
-       at save time so ``adj_t`` is cached in ``processed_data/graph``).
+       at save time so ``adj_t`` is cached in ``processed_data/graph/data.pt``).
     2. **Symmetrise** adjacency: ``data.adj_t = data.adj_t.to_symmetric()``
        — adds reverse edges so message passing is bidirectional.
     3. **Z-score normalise** features: ``x = (x − μ) / σ`` per column.
