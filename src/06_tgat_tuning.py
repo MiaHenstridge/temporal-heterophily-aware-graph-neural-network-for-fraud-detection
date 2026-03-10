@@ -95,7 +95,7 @@ parser.add_argument('--time_dim',        type=int,   default=100,
                     help='dimension of the sinusoidal time encoding')
 parser.add_argument('--n_head',          type=int,   default=2,
                     help='number of attention heads in TransformerConv')
-parser.add_argument('--n_neighbor',      type=int,   default=20,
+parser.add_argument('--n_neighbor',      type=int,   default=10,
                     help='neighbors sampled per layer in NeighborLoader')
 parser.add_argument('--fold',            type=int,   default=0)
 parser.add_argument('--prefix',          type=str,   default='')
@@ -184,10 +184,10 @@ device = torch.device(f'cuda:{GPU}' if torch.cuda.is_available() else 'cpu')
 if NUM_LAYER == 1:
     num_neighbors = [NUM_NEIGHBOR]
 elif NUM_LAYER == 2:
-    num_neighbors = [NUM_NEIGHBOR, 10]
+    num_neighbors = [NUM_NEIGHBOR, 5]
 else:
-    step = max(1, (NUM_NEIGHBOR - 10) // (NUM_LAYER - 1))
-    num_neighbors = [max(10, NUM_NEIGHBOR - i * step) for i in range(NUM_LAYER)]
+    step = max(1, (NUM_NEIGHBOR - 5) // (NUM_LAYER - 1))
+    num_neighbors = [max(5, NUM_NEIGHBOR - i * step) for i in range(NUM_LAYER)]
 
 logger.info(f'NeighborLoader fanouts (outer→inner): {num_neighbors}')
 
