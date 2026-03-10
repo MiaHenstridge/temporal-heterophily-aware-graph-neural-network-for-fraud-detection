@@ -18,7 +18,7 @@ from sklearn.metrics import (
 )
 
 from torch_geometric.loader import NeighborLoader
-from torch_geometric.nn import SAGEConv, GATConv, GATv2Conv
+from models import GraphSAGEModel, GATModel, GATv2Model
 
 import mlflow
 import matplotlib
@@ -62,7 +62,7 @@ parser.add_argument('--pos_weight',      type=float, default=100,
                     help='positive class weight for BCE loss. -1 = auto (n_neg/n_pos)')
 parser.add_argument('--num_workers',     type=int,   default=12)
 parser.add_argument('--weight_decay',    type=float, default=5e-7)
-parser.add_argument('--early_stop_higher_better', action='store_false')
+parser.add_argument('--early_stop_higher_better', action='store_true', default=False)
 
 try:
     args = parser.parse_args()
@@ -161,115 +161,6 @@ test_loader = NeighborLoader(
     shuffle       = False,
     num_workers   = NUM_WORKERS,
 )
-
-################## model definitions ##################
-# In NeighborLoader mini-batch training the subgraph for each batch contains
-# seed nodes + their sampled neighbours. Seed nodes are always placed first
-# (indices 0..batch_size-1). The full GNN runs on the subgraph; only seed
-# nodes are classified.
-
-class GraphSAGEModel(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, n_layers, dropout):
-        super().__init__()
-        self.convs   = torch.nn.ModuleList()
-        self.norms   = torch.nn.ModuleList()
-        self.dropout = dropout
-
-        self.convs.append(SAGEConv(in_channels, hidden_channels))
-        self.norms.append(torch.nn.BatchNorm1d(hidden_channels))
-        for _ in range(n_layers - 1):
-            self.convs.append(SAGEConv(hidden_channels, hidden_channels))
-            self.norms.append(torch.nn.BatchNorm1d(hidden_channels))
-
-        self.clf = torch.nn.Sequential(
-            torch.nn.Linear(hidden_channels, hidden_channels),
-            torch.nn.BatchNorm1d(hidden_channels),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_channels, hidden_channels // 2),
-            torch.nn.BatchNorm1d(hidden_channels // 2),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_channels // 2, 1),
-        )
-
-    def forward(self, x, edge_index, batch_size):
-        h = x
-        for conv, norm in zip(self.convs, self.norms):
-            h = norm(conv(h, edge_index).relu())
-            h = F.dropout(h, p=self.dropout, training=self.training)
-        return self.clf(h[:batch_size]).squeeze(-1)
-
-
-class GATModel(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, n_layers, heads, dropout):
-        super().__init__()
-        self.convs   = torch.nn.ModuleList()
-        self.norms   = torch.nn.ModuleList()
-        self.dropout = dropout
-
-        self.convs.append(GATConv(in_channels, hidden_channels // heads,
-                                   heads=heads, dropout=dropout, concat=True))
-        self.norms.append(torch.nn.BatchNorm1d(hidden_channels))
-        for _ in range(n_layers - 1):
-            self.convs.append(GATConv(hidden_channels, hidden_channels // heads,
-                                       heads=heads, dropout=dropout, concat=True))
-            self.norms.append(torch.nn.BatchNorm1d(hidden_channels))
-
-        self.clf = torch.nn.Sequential(
-            torch.nn.Linear(hidden_channels, hidden_channels),
-            torch.nn.BatchNorm1d(hidden_channels),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_channels, hidden_channels // 2),
-            torch.nn.BatchNorm1d(hidden_channels // 2),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_channels // 2, 1),
-        )
-
-    def forward(self, x, edge_index, batch_size):
-        h = x
-        for conv, norm in zip(self.convs, self.norms):
-            h = norm(conv(h, edge_index).relu())
-            h = F.dropout(h, p=self.dropout, training=self.training)
-        return self.clf(h[:batch_size]).squeeze(-1)
-
-
-class GATv2Model(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, n_layers, heads, dropout):
-        super().__init__()
-        self.convs   = torch.nn.ModuleList()
-        self.norms   = torch.nn.ModuleList()
-        self.dropout = dropout
-
-        self.convs.append(GATv2Conv(in_channels, hidden_channels // heads,
-                                     heads=heads, dropout=dropout, concat=True))
-        self.norms.append(torch.nn.BatchNorm1d(hidden_channels))
-        for _ in range(n_layers - 1):
-            self.convs.append(GATv2Conv(hidden_channels, hidden_channels // heads,
-                                         heads=heads, dropout=dropout, concat=True))
-            self.norms.append(torch.nn.BatchNorm1d(hidden_channels))
-
-        self.clf = torch.nn.Sequential(
-            torch.nn.Linear(hidden_channels, hidden_channels),
-            torch.nn.BatchNorm1d(hidden_channels),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_channels, hidden_channels // 2),
-            torch.nn.BatchNorm1d(hidden_channels // 2),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_channels // 2, 1),
-        )
-
-    def forward(self, x, edge_index, batch_size):
-        h = x
-        for conv, norm in zip(self.convs, self.norms):
-            h = norm(conv(h, edge_index).relu())
-            h = F.dropout(h, p=self.dropout, training=self.training)
-        return self.clf(h[:batch_size]).squeeze(-1)
-
 
 if MODEL_TYPE == 'sage':
     model = GraphSAGEModel(

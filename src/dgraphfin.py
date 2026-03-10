@@ -34,6 +34,7 @@ import os
 from typing import Callable, NamedTuple, Optional
 
 import numpy as np
+import pandas as pd
 import torch
 import torch_geometric.transforms as T
 from torch_geometric.data import Data, InMemoryDataset
@@ -280,3 +281,66 @@ def load_dgraphfin(data_dir: str, fold: int = 0) -> DGraphFinBundle:
         train_labels  = train_labels,
         node_feat_dim = node_feat_dim,
     )
+
+
+def load_dgraphfin_temporal(data_dir, fold=0, max_time_steps=32):
+    dataset = DGraphFin(root=os.path.join(data_dir, 'DGraphFin'), pre_transform=T.ToSparseTensor())
+    data    = dataset[0]
+
+    # z-score normalise features
+    x = data.x
+    x = (x - x.mean(0)) / x.std(0)
+    data.x = x
+
+    if data.y.dim() == 2:
+        data.y = data.y.squeeze(1)
+
+    node_feat_dim = data.num_features
+    N             = data.num_nodes
+
+    # directed edge_index from adj_t  (row=dst, col=src)
+    row_t, col_t, _ = data.adj_t.coo()
+    src = col_t
+    dst = row_t
+    edge_index_directed = torch.stack([src, dst], dim=0)
+
+    # edge_time: shift → normalise → discretise → reshape  (process_data steps 1-4)
+    et = data.edge_time.float()
+    et = et - et.min()
+    et = et / et.max()
+    et = (et * max_time_steps).long()
+    et = et.view(-1, 1).float()
+
+    # node_time = min out-edge time per node  (groupby-min)
+    edge_np     = torch.cat([edge_index_directed, et.view(1, -1)], dim=0).T.numpy()
+    df          = pd.DataFrame(edge_np, columns=['src', 'dst', 'time'])
+    min_time_df = df.groupby('src')['time'].min()
+    node_time_np = np.zeros(N, dtype=np.float32)
+    node_time_np[min_time_df.index.astype(int)] = min_time_df.values.astype(np.float32)
+    node_time = torch.tensor(node_time_np)
+
+    # symmetrise: repeat same edge_time for both directions
+    edge_index_sym = torch.cat([edge_index_directed, edge_index_directed[[1, 0], :]], dim=1)
+    edge_attr_sym  = torch.cat([et, et], dim=0)
+
+    # split masks
+    train_idx = data.train_mask
+    val_idx   = data.valid_mask
+    test_idx  = data.test_mask
+    if train_idx.dim() > 1 and train_idx.shape[1] > 1:
+        train_idx = train_idx[:, fold]
+        val_idx   = val_idx[:, fold]
+        test_idx  = test_idx[:, fold]
+
+    y_binary     = (data.y == 1).float()
+    train_labels = y_binary[train_idx].numpy()
+
+    graph = Data(
+        x          = data.x,
+        edge_index = edge_index_sym,
+        edge_attr  = edge_attr_sym,
+        node_time  = node_time,
+        y          = y_binary,
+        num_nodes  = N,
+    )
+    return graph, train_idx, val_idx, test_idx, train_labels, node_feat_dim

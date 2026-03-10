@@ -48,7 +48,6 @@ import argparse
 import torch
 import torch.nn.functional as F
 import numpy as np
-import pandas as pd
 from tqdm import tqdm
 from sklearn.metrics import (
     roc_auc_score,
@@ -59,9 +58,8 @@ from sklearn.metrics import (
     precision_score,
 )
 
-from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
-from torch_geometric.nn import TransformerConv
+from models import TGATModel
 
 import mlflow
 import matplotlib
@@ -70,7 +68,7 @@ import matplotlib.pyplot as plt
 
 from utils import EarlyStopMonitor
 from namespaces import DA
-from dgraphfin import DGraphFin   # reuse existing dataset class
+from dgraphfin import DGraphFin, load_dgraphfin_temporal  # reuse existing dataset class
 
 # ── working directory: project root ──────────────────────────────────────────
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -109,6 +107,7 @@ parser.add_argument('--num_workers',     type=int,   default=12)
 parser.add_argument('--weight_decay',    type=float, default=5e-7)
 parser.add_argument('--max_time_steps',  type=int,   default=32,
                     help='discretisation scale for edge timestamps (default 32)')
+parser.add_argument('--early_stop_higher_better', action='store_true', default=False)
 
 try:
     args = parser.parse_args()
@@ -131,6 +130,7 @@ MAX_ROUND     = args.max_round
 TOLERANCE     = args.tolerance
 NUM_WORKERS   = args.num_workers
 WEIGHT_DECAY  = args.weight_decay
+EARLY_STOP_HIGHER_BETTER = args.early_stop_higher_better
 
 MODEL_SAVE_PATH     = f'./saved_models/tgat-{args.prefix}-node-{DATA}.pth'
 get_checkpoint_path = lambda epoch: f'./saved_checkpoints/tgat-{args.prefix}-node-{DATA}-{epoch}.pt'
@@ -151,309 +151,6 @@ fh.setFormatter(fmt); ch.setFormatter(fmt)
 logger.addHandler(fh); logger.addHandler(ch)
 logger.info(args)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Temporal data loading
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_dgraphfin_temporal(data_dir: str, fold: int = 0, max_time_steps: int = 32):
-    """
-    Extend the existing DGraphFin dataset with temporal information for TGAT,
-    following the original process_data() logic exactly.
-
-    Edge-time processing (process_data steps 1-4)
-    ----------------------------------------------
-    1. Shift:       edge_time -= edge_time.min()          (start from 0)
-    2. Normalise:   edge_time /= edge_time.max()          (range [0, 1])
-    3. Discretise:  edge_time = (edge_time * max_time_steps).long()
-    4. Reshape:     edge_time = edge_time.view(-1, 1).float()   → [E, 1]
-
-    Node-time (process_data groupby-min)
-    -------------------------------------
-    node_time[v] = min(edge_time) over all out-edges of v.
-    Nodes with no out-edges get 0.
-
-    Symmetrisation (process_data)
-    ------------------------------
-    Reverse edges are added as edge_index[[1,0],:].
-    The SAME edge_time is reused for both directions (no Δt computation).
-
-    Parameters
-    ----------
-    data_dir : str
-    fold : int
-    max_time_steps : int   Discretisation scale; default 32 matches the original.
-    """
-    import pandas as pd
-    import torch_geometric.transforms as T
-
-    # ── load cached dataset (shared with static baselines) ──────────────────
-    dataset = DGraphFin(root=data_dir, pre_transform=T.ToSparseTensor())
-    data    = dataset[0]
-
-    # ── z-score normalise features ───────────────────────────────────────────
-    x      = data.x
-    x      = (x - x.mean(0)) / x.std(0)
-    data.x = x
-
-    # ── squeeze label tensor ─────────────────────────────────────────────────
-    if data.y.dim() == 2:
-        data.y = data.y.squeeze(1)
-
-    node_feat_dim = data.num_features
-    N             = data.num_nodes
-
-    # ── recover directed edge_index from adj_t ───────────────────────────────
-    # adj_t convention: row=dst, col=src  →  src=col, dst=row
-    row_t, col_t, _ = data.adj_t.coo()
-    src = col_t                                             # [E]
-    dst = row_t                                             # [E]
-    edge_index_directed = torch.stack([src, dst], dim=0)   # [2, E]
-
-    # ── Steps 1-4: edge_time processing (exactly as process_data) ────────────
-    et = data.edge_time.float()
-    et = et - et.min()                       # 1. shift
-    et = et / et.max()                       # 2. normalise
-    et = (et * max_time_steps).long()        # 3. discretise
-    et = et.view(-1, 1).float()              # 4. reshape  → [E, 1]
-
-    # ── node_time via groupby-min (exactly as process_data) ─────────────────
-    # Original stacks [edge_index (2×E), edge_time (1×E)] → [3, E] then
-    # transposes to DataFrame and does groupby(src_col).min().
-    edge_np  = torch.cat(
-        [edge_index_directed, et.view(1, -1)], dim=0
-    ).T.numpy()                              # [E, 3]: src | dst | time
-
-    df          = pd.DataFrame(edge_np, columns=['src', 'dst', 'time'])
-    min_time_df = df.groupby('src')['time'].min()   # Series: src_id → min_time
-
-    node_time_np = np.zeros(N, dtype=np.float32)
-    node_time_np[min_time_df.index.astype(int)] = min_time_df.values.astype(np.float32)
-    node_time = torch.tensor(node_time_np)   # [N]
-
-    # ── symmetrise (exactly as process_data) ─────────────────────────────────
-    # edge_index[[1,0],:] flips src↔dst; edge_time is simply repeated.
-    edge_index_sym = torch.cat(
-        [edge_index_directed, edge_index_directed[[1, 0], :]], dim=1
-    )                                        # [2, 2E]
-    edge_attr_sym  = torch.cat([et, et], dim=0)   # [2E, 1]
-
-    # ── split masks ──────────────────────────────────────────────────────────
-    train_idx = data.train_mask
-    val_idx   = data.valid_mask
-    test_idx  = data.test_mask
-
-    if train_idx.dim() > 1 and train_idx.shape[1] > 1:
-        train_idx = train_idx[:, fold]
-        val_idx   = val_idx[:, fold]
-        test_idx  = test_idx[:, fold]
-
-    # ── binary labels ────────────────────────────────────────────────────────
-    y_binary     = (data.y == 1).float()
-    train_labels = y_binary[train_idx].numpy()
-
-    # ── assemble graph ───────────────────────────────────────────────────────
-    graph = Data(
-        x          = data.x,             # [N, 17]   z-score normalised
-        edge_index = edge_index_sym,     # [2, 2E]   bidirectional
-        edge_attr  = edge_attr_sym,      # [2E, 1]   discretised edge time
-        node_time  = node_time,          # [N]       min out-edge time per node
-        y          = y_binary,           # [N]       binary fraud label
-        num_nodes  = N,
-    )
-
-    return graph, train_idx, val_idx, test_idx, train_labels, node_feat_dim
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sinusoidal time encoding  (Bochner / TGAT paper eq. 2)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TimeEncode(torch.nn.Module):
-    """
-    Learnable sinusoidal time encoding from the original TGAT implementation:
-    https://github.com/StatsDLMathsRecomSys/Inductive-representation-learning-on-temporal-graphs
-
-    Maps a scalar time value t to a time_dim-dimensional vector:
-
-        φ(t) = cos(t · basis_freq + phase)
-
-    where basis_freq and phase are **learned** parameters initialised as:
-        basis_freq  ~ log-spaced  1 / 10^linspace(0, 9, time_dim)
-        phase       ~ zeros
-
-    Parameters
-    ----------
-    expand_dim : int
-        Output dimensionality (called time_dim elsewhere in this file).
-    factor : int
-        Stored for compatibility with the original API; not used in forward.
-    """
-
-    def __init__(self, expand_dim: int, factor: int = 5):
-        super().__init__()
-        time_dim    = expand_dim
-        self.factor = factor
-        self.basis_freq = torch.nn.Parameter(
-            torch.from_numpy(
-                1 / 10 ** np.linspace(0, 9, time_dim)
-            ).float()
-        )                                             # [time_dim]  learned
-        self.phase = torch.nn.Parameter(
-            torch.zeros(time_dim).float()
-        )                                             # [time_dim]  learned
-
-    def forward(self, ts: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        ts : Tensor  shape [N, L]
-            Raw time scalars arranged as a 2-D batch
-            (N = nodes/edges, L = sequence length; L=1 for single timestamps).
-
-        Returns
-        -------
-        Tensor  shape [N, L, time_dim]
-        """
-        batch_size = ts.size(0)
-        seq_len    = ts.size(1)
-
-        ts      = ts.view(batch_size, seq_len, 1)              # [N, L, 1]
-        map_ts  = ts * self.basis_freq.view(1, 1, -1)          # [N, L, time_dim]
-        map_ts  = map_ts + self.phase.view(1, 1, -1)           # [N, L, time_dim]
-
-        harmonic = torch.cos(map_ts)                           # [N, L, time_dim]
-        return harmonic
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TGAT model
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TGATModel(torch.nn.Module):
-    """
-    Temporal Graph Attention Network for node classification.
-
-    Each layer:
-        1. Encode the scalar Δt on each edge → edge embedding ∈ R^time_dim
-        2. Concatenate node feature with its node_time encoding → augmented input
-        3. TransformerConv with edge_dim=time_dim (multi-head dot-product attn)
-        4. BN → ReLU → Dropout
-    MLP classifier head identical to the static GNN baselines.
-
-    Parameters
-    ----------
-    in_channels : int
-        Raw node feature dimension (17 for DGraphFin).
-    hidden_channels : int
-        Hidden dimension after each conv layer.
-    n_layers : int
-        Number of TGAT layers to stack.
-    n_head : int
-        Number of attention heads (hidden_channels must be divisible by n_head).
-    time_dim : int
-        Dimension of sinusoidal time encoding used for both node and edge times.
-    dropout : float
-        Dropout probability applied after each conv layer and in the MLP.
-    """
-
-    def __init__(
-        self,
-        in_channels:     int,
-        hidden_channels: int,
-        n_layers:        int,
-        n_head:          int,
-        time_dim:        int,
-        dropout:         float = 0.2,
-    ):
-        super().__init__()
-        assert hidden_channels % n_head == 0, \
-            f'hidden_channels ({hidden_channels}) must be divisible by n_head ({n_head})'
-
-        self.time_enc = TimeEncode(time_dim)
-        self.dropout  = dropout
-        self.n_layers = n_layers
-
-        # Each conv expects:  node features  +  time encoding of the node
-        # → input dim = in_channels + time_dim for layer 0,
-        #              hidden_channels + time_dim for subsequent layers.
-        self.convs = torch.nn.ModuleList()
-        self.norms = torch.nn.ModuleList()
-
-        first_in = in_channels + time_dim
-        self.convs.append(
-            TransformerConv(
-                in_channels  = first_in,
-                out_channels = hidden_channels // n_head,
-                heads        = n_head,
-                edge_dim     = time_dim,   # edge_attr will be time-encoded Δt
-                dropout      = dropout,
-                concat       = True,
-                beta         = False,
-            )
-        )
-        self.norms.append(torch.nn.BatchNorm1d(hidden_channels))
-
-        for _ in range(n_layers - 1):
-            self.convs.append(
-                TransformerConv(
-                    in_channels  = hidden_channels + time_dim,
-                    out_channels = hidden_channels // n_head,
-                    heads        = n_head,
-                    edge_dim     = time_dim,
-                    dropout      = dropout,
-                    concat       = True,
-                    beta         = False,
-                )
-            )
-            self.norms.append(torch.nn.BatchNorm1d(hidden_channels))
-
-        # MLP classifier head — identical structure to static GNN baselines
-        self.clf = torch.nn.Sequential(
-            torch.nn.Linear(hidden_channels, hidden_channels),
-            torch.nn.BatchNorm1d(hidden_channels),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_channels, hidden_channels // 2),
-            torch.nn.BatchNorm1d(hidden_channels // 2),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_channels // 2, 1),
-        )
-
-    def forward(
-        self,
-        x:          torch.Tensor,   # [N_sub, in_channels]
-        edge_index: torch.Tensor,   # [2, E_sub]
-        edge_attr:  torch.Tensor,   # [E_sub, 1]   raw Δt scalars
-        node_time:  torch.Tensor,   # [N_sub]       node timestamps
-        batch_size: int,
-    ) -> torch.Tensor:              # [batch_size]  logits
-
-        # ── encode edge time deltas ───────────────────────────────────────────
-        # TimeEncode expects [N, L]; edge_attr is [E, 1] so L=1.
-        # Output: [E, 1, time_dim] → squeeze to [E, time_dim]
-        edge_time_enc = self.time_enc(edge_attr).squeeze(1)        # [E, time_dim]
-
-        # ── encode node timestamps ────────────────────────────────────────────
-        # node_time: [N] → unsqueeze → [N, 1] → TimeEncode → [N, 1, time_dim]
-        # → squeeze → [N, time_dim]
-        node_time_enc = self.time_enc(
-            node_time.unsqueeze(1)
-        ).squeeze(1)                                               # [N, time_dim]
-
-        # ── first layer ───────────────────────────────────────────────────────
-        h = torch.cat([x, node_time_enc], dim=-1)                  # [N, in + time_dim]
-        h = self.norms[0](self.convs[0](h, edge_index, edge_attr=edge_time_enc).relu())
-        h = F.dropout(h, p=self.dropout, training=self.training)
-
-        # ── subsequent layers ─────────────────────────────────────────────────
-        for conv, norm in zip(self.convs[1:], self.norms[1:]):
-            h = torch.cat([h, node_time_enc], dim=-1)              # [N, hidden + time_dim]
-            h = norm(conv(h, edge_index, edge_attr=edge_time_enc).relu())
-            h = F.dropout(h, p=self.dropout, training=self.training)
-
-        # ── classify seed nodes only ──────────────────────────────────────────
-        return self.clf(h[:batch_size]).squeeze(-1)         # [batch_size]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -606,7 +303,7 @@ def eval_nodes(loader):
 # Training loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-early_stopper    = EarlyStopMonitor(max_round=MAX_ROUND, higher_better=False, tolerance=TOLERANCE)
+early_stopper    = EarlyStopMonitor(max_round=MAX_ROUND, higher_better=EARLY_STOP_HIGHER_BETTER, tolerance=TOLERANCE)
 last_saved_epoch = -1
 
 train_loss_hist = []
