@@ -38,6 +38,7 @@ import pandas as pd
 import torch
 import torch_geometric.transforms as T
 from torch_geometric.data import Data, InMemoryDataset
+# import torch_geometric as tg
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Return type of load_dgraphfin
@@ -178,7 +179,7 @@ class DGraphFin(InMemoryDataset):
 # One-call processing helper
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_dgraphfin(data_dir: str, fold: int = 0) -> DGraphFinBundle:
+def load_dgraphfin(data_dir: str, fold: int = 0, to_undirected: bool = True) -> DGraphFinBundle:
     """
     Load DGraphFin from *data_dir*, apply all processing steps from the
     reference repo (``gnn_mini_batch.py``), and return a
@@ -220,10 +221,9 @@ def load_dgraphfin(data_dir: str, fold: int = 0) -> DGraphFinBundle:
     )
     data = dataset[0]
 
-    # ── Step 2: symmetrise adjacency ────────────────────────────────────────
-    # Mirrors: data.adj_t = data.adj_t.to_symmetric()
-    # Ensures every directed edge u→v also exists as v→u for aggregation.
-    data.adj_t = data.adj_t.to_symmetric()
+    # ── Step 2: symmetrise adjacency (optional) ─────────────────────────────
+    if to_undirected:
+        data.adj_t = data.adj_t.to_symmetric()
 
     # ── Step 3: z-score feature normalisation ───────────────────────────────
     # Mirrors: x = (x - x.mean(0)) / x.std(0)
@@ -257,18 +257,21 @@ def load_dgraphfin(data_dir: str, fold: int = 0) -> DGraphFinBundle:
     y_binary      = (data.y == 1).float()
     train_labels  = y_binary[train_idx].numpy()
 
-    # ── Step 7: materialise symmetric edge_index for NeighborLoader ─────────
-    # T.ToSparseTensor() stores connectivity in data.adj_t (transposed CSR).
-    # After .to_symmetric() it encodes both directions.  We recover COO
-    # edge_index because NeighborLoader requires it.
-    row, col, _    = data.adj_t.t().coo()
-    edge_index_sym = torch.stack([row, col], dim=0)
+    # ── Step 7: materialise edge_index for NeighborLoader ───────────────────
+    # adj_t is transposed CSR: row=dst, col=src convention.
+    # When to_undirected=True, symmetrisation has already been applied and
+    # .t().coo() gives (src, dst) directly.
+    # When to_undirected=False, swap row/col from the raw adj_t to recover
+    # (src, dst) convention for the directed graph.
+    if to_undirected:
+        row, col, _ = data.adj_t.t().coo()
+    else:
+        col, row, _ = data.adj_t.coo()     # adj_t: row=dst, col=src → swap
+    edge_index_out = torch.stack([row, col], dim=0)
 
-    # Assemble the graph object that NeighborLoader will sample from.
-    # y_binary is attached so batch.y[:batch_size] gives float targets directly.
     graph = Data(
         x          = data.x,
-        edge_index = edge_index_sym,
+        edge_index = edge_index_out,
         y          = y_binary,
         num_nodes  = data.num_nodes,
     )
@@ -283,7 +286,7 @@ def load_dgraphfin(data_dir: str, fold: int = 0) -> DGraphFinBundle:
     )
 
 
-def load_dgraphfin_temporal(data_dir, fold=0, max_time_steps=32):
+def load_dgraphfin_temporal(data_dir, fold=0, to_undirected=True):
     dataset = DGraphFin(root=os.path.join(data_dir, 'DGraphFin'), pre_transform=T.ToSparseTensor())
     data    = dataset[0]
 
@@ -304,24 +307,31 @@ def load_dgraphfin_temporal(data_dir, fold=0, max_time_steps=32):
     dst = row_t
     edge_index_directed = torch.stack([src, dst], dim=0)
 
-    # edge_time: shift → normalise → discretise → reshape  (process_data steps 1-4)
-    et = data.edge_time.float()
-    et = et - et.min()
-    et = et / et.max()
-    et = (et * max_time_steps).long()
-    et = et.view(-1, 1).float()
+    # edge timestamps from DGraphFinv2 dataset
+    et = torch.tensor(
+        np.load(os.path.join(data_dir, 'DGraphFin', 'dgraphfinv2_edge_timestamp.npy')),
+        dtype=torch.float,
+    ).view(-1, 1)                                                  # [E, 1]
 
-    # node_time = min out-edge time per node  (groupby-min)
-    edge_np     = torch.cat([edge_index_directed, et.view(1, -1)], dim=0).T.numpy()
-    df          = pd.DataFrame(edge_np, columns=['src', 'dst', 'time'])
-    min_time_df = df.groupby('src')['time'].min()
-    node_time_np = np.zeros(N, dtype=np.float32)
-    node_time_np[min_time_df.index.astype(int)] = min_time_df.values.astype(np.float32)
-    node_time = torch.tensor(node_time_np)
+    # node timestamps from DGraphFinv2 dataset
+    # foreground nodes: label-assignment timestamp
+    # background nodes: large negative sentinel value
+    node_time = torch.tensor(
+        np.load(os.path.join(data_dir, 'DGraphFin', 'dgraphfinv2_node_timestamp.npy')),
+        dtype=torch.float,
+    )                                                              # [N]
 
-    # symmetrise: repeat same edge_time for both directions
-    edge_index_sym = torch.cat([edge_index_directed, edge_index_directed[[1, 0], :]], dim=1)
-    edge_attr_sym  = torch.cat([et, et], dim=0)
+    # symmetrise: repeat edge_time and edge_type for both directions (optional)
+    if to_undirected:
+        edge_index_out = torch.cat([edge_index_directed, edge_index_directed[[1, 0], :]], dim=1)
+        et_out         = torch.cat([et, et], dim=0)                # [2E, 1]
+        edge_type_out  = torch.cat(
+            [data.edge_type, data.edge_type], dim=0
+        ).reshape(-1, 1)                                           # [2E, 1]
+    else:
+        edge_index_out = edge_index_directed
+        et_out         = et                                        # [E, 1]
+        edge_type_out  = data.edge_type.reshape(-1, 1)             # [E, 1]
 
     # split masks
     train_idx = data.train_mask
@@ -337,8 +347,9 @@ def load_dgraphfin_temporal(data_dir, fold=0, max_time_steps=32):
 
     graph = Data(
         x          = data.x,
-        edge_index = edge_index_sym,
-        edge_attr  = edge_attr_sym,
+        edge_index = edge_index_out,
+        edge_attr  = edge_type_out,
+        time       = et_out,
         node_time  = node_time,
         y          = y_binary,
         num_nodes  = N,

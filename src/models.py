@@ -176,30 +176,22 @@ class TimeEncode(torch.nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 # TGAT model
 # ─────────────────────────────────────────────────────────────────────────────
-
 class TGATModel(torch.nn.Module):
     """
     Temporal Graph Attention Network for node classification.
-
-    Each layer:
-        1. Encode the scalar Δt on each edge → edge embedding ∈ R^time_dim
-        2. Concatenate node feature with its node_time encoding → augmented input
-        3. TransformerConv with edge_dim=time_dim (multi-head dot-product attn)
-        4. BN → ReLU → Dropout
-    MLP classifier head identical to the static GNN baselines.
 
     Parameters
     ----------
     in_channels : int
         Raw node feature dimension (17 for DGraphFin).
     hidden_channels : int
-        Hidden dimension after each conv layer.
+        Hidden dimension (must be divisible by n_head).
     n_layers : int
         Number of TGAT layers to stack.
     n_head : int
-        Number of attention heads (hidden_channels must be divisible by n_head).
+        Number of attention heads in TransformerConv.
     time_dim : int
-        Dimension of sinusoidal time encoding used for both node and edge times.
+        Dimension of the sinusoidal time encoding.
     dropout : float
         Dropout probability applied after each conv layer and in the MLP.
     """
@@ -217,34 +209,18 @@ class TGATModel(torch.nn.Module):
         assert hidden_channels % n_head == 0, \
             f'hidden_channels ({hidden_channels}) must be divisible by n_head ({n_head})'
 
-        self.time_enc = TimeEncode(time_dim)
-        self.dropout  = dropout
-        self.n_layers = n_layers
+        self.time_enc   = TimeEncode(time_dim)
+        self.input_proj = torch.nn.Linear(in_channels, hidden_channels)
+        self.dropout    = dropout
+        self.n_layers   = n_layers
 
-        # Each conv expects:  node features  +  time encoding of the node
-        # → input dim = in_channels + time_dim for layer 0,
-        #              hidden_channels + time_dim for subsequent layers.
         self.convs = torch.nn.ModuleList()
         self.norms = torch.nn.ModuleList()
 
-        first_in = in_channels + time_dim
-        self.convs.append(
-            TransformerConv(
-                in_channels  = first_in,
-                out_channels = hidden_channels // n_head,
-                heads        = n_head,
-                edge_dim     = time_dim,   # edge_attr will be time-encoded Δt
-                dropout      = dropout,
-                concat       = True,
-                beta         = False,
-            )
-        )
-        self.norms.append(torch.nn.BatchNorm1d(hidden_channels))
-
-        for _ in range(n_layers - 1):
+        for _ in range(n_layers):
             self.convs.append(
                 TransformerConv(
-                    in_channels  = hidden_channels + time_dim,
+                    in_channels  = hidden_channels,
                     out_channels = hidden_channels // n_head,
                     heads        = n_head,
                     edge_dim     = time_dim,
@@ -255,7 +231,6 @@ class TGATModel(torch.nn.Module):
             )
             self.norms.append(torch.nn.BatchNorm1d(hidden_channels))
 
-        # MLP classifier head — identical structure to static GNN baselines
         self.clf = torch.nn.Sequential(
             torch.nn.Linear(hidden_channels, hidden_channels),
             torch.nn.BatchNorm1d(hidden_channels),
@@ -272,33 +247,23 @@ class TGATModel(torch.nn.Module):
         self,
         x:          torch.Tensor,   # [N_sub, in_channels]
         edge_index: torch.Tensor,   # [2, E_sub]
-        edge_attr:  torch.Tensor,   # [E_sub, 1]   raw Δt scalars
-        node_time:  torch.Tensor,   # [N_sub]       node timestamps
+        time:       torch.Tensor,   # [E_sub, 1]   raw edge timestamps  (graph.time)
+        node_time:  torch.Tensor,   # [N_sub]      node timestamps       (graph.node_time)
         batch_size: int,
     ) -> torch.Tensor:              # [batch_size]  logits
 
-        # ── encode edge time deltas ───────────────────────────────────────────
-        # TimeEncode expects [N, L]; edge_attr is [E, 1] so L=1.
-        # Output: [E, 1, time_dim] → squeeze to [E, time_dim]
-        edge_time_enc = self.time_enc(edge_attr).squeeze(1)        # [E, time_dim]
+        # ── relative time per edge ────────────────────────────────────────────
+        # rel_t = node_time[src] - edge_time  →  [E, 1]
+        rel_t     = node_time[edge_index[0]].view(-1, 1) - time   # [E, 1]
+        rel_t_enc = self.time_enc(rel_t).squeeze(1)               # [E, time_dim]
 
-        # ── encode node timestamps ────────────────────────────────────────────
-        # node_time: [N] → unsqueeze → [N, 1] → TimeEncode → [N, 1, time_dim]
-        # → squeeze → [N, time_dim]
-        node_time_enc = self.time_enc(
-            node_time.unsqueeze(1)
-        ).squeeze(1)                                               # [N, time_dim]
+        # ── input projection ──────────────────────────────────────────────────
+        h = F.relu(self.input_proj(x))                            # [N, hidden]
 
-        # ── first layer ───────────────────────────────────────────────────────
-        h = torch.cat([x, node_time_enc], dim=-1)                  # [N, in + time_dim]
-        h = self.norms[0](self.convs[0](h, edge_index, edge_attr=edge_time_enc).relu())
-        h = F.dropout(h, p=self.dropout, training=self.training)
-
-        # ── subsequent layers ─────────────────────────────────────────────────
-        for conv, norm in zip(self.convs[1:], self.norms[1:]):
-            h = torch.cat([h, node_time_enc], dim=-1)              # [N, hidden + time_dim]
-            h = norm(conv(h, edge_index, edge_attr=edge_time_enc).relu())
+        # ── conv layers ───────────────────────────────────────────────────────
+        for conv, norm in zip(self.convs, self.norms):
+            h = norm(conv(h, edge_index, edge_attr=rel_t_enc).relu())
             h = F.dropout(h, p=self.dropout, training=self.training)
 
         # ── classify seed nodes only ──────────────────────────────────────────
-        return self.clf(h[:batch_size]).squeeze(-1)         # [batch_size]
+        return self.clf(h[:batch_size]).squeeze(-1)               # [batch_size]

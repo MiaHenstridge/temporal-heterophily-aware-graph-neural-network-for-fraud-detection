@@ -105,8 +105,8 @@ parser.add_argument('--pos_weight',      type=float, default=100,
                     help='positive class weight; -1 = auto (n_neg/n_pos)')
 parser.add_argument('--num_workers',     type=int,   default=12)
 parser.add_argument('--weight_decay',    type=float, default=5e-7)
-parser.add_argument('--max_time_steps',  type=int,   default=32,
-                    help='discretisation scale for edge timestamps (default 32)')
+parser.add_argument('--to_undirected',  action='store_true',   default=False,
+                    help='symmetrize edges into undirected edges')
 parser.add_argument('--early_stop_higher_better', action='store_true', default=False)
 
 try:
@@ -159,7 +159,7 @@ logger.info(args)
 
 (graph, train_idx, val_idx, test_idx,
  train_labels_np, node_feat_dim) = load_dgraphfin_temporal(
-    data_dir=args.data_dir, fold=args.fold, max_time_steps=args.max_time_steps
+    data_dir=args.data_dir, fold=args.fold, to_undirected=args.to_undirected,
 )
 
 logger.info(
@@ -198,6 +198,8 @@ train_loader = NeighborLoader(
     num_neighbors = num_neighbors,
     batch_size    = BATCH_SIZE,
     input_nodes   = train_idx,
+    input_time    = graph.node_time[train_idx],
+    time_attr     = 'time',
     shuffle       = True,
     num_workers   = NUM_WORKERS,
 )
@@ -207,6 +209,8 @@ val_loader = NeighborLoader(
     num_neighbors = num_neighbors,
     batch_size    = BATCH_SIZE * 2,
     input_nodes   = val_idx,
+    input_time    = graph.node_time[val_idx],
+    time_attr     = 'time',
     shuffle       = False,
     num_workers   = NUM_WORKERS,
 )
@@ -216,6 +220,8 @@ test_loader = NeighborLoader(
     num_neighbors = num_neighbors,
     batch_size    = BATCH_SIZE * 2,
     input_nodes   = test_idx,
+    input_time    = graph.node_time[test_idx],
+    time_attr     = 'time',
     shuffle       = False,
     num_workers   = NUM_WORKERS,
 )
