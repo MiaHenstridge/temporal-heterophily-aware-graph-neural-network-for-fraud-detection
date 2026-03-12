@@ -97,6 +97,7 @@ parser.add_argument('--n_head',          type=int,   default=2,
                     help='number of attention heads in TransformerConv')
 parser.add_argument('--n_neighbor',      type=int,   default=10,
                     help='neighbors sampled per layer in NeighborLoader')
+parser.add_argument('--temporal_strategy', type=str, default='uniform')
 parser.add_argument('--fold',            type=int,   default=0)
 parser.add_argument('--prefix',          type=str,   default='')
 parser.add_argument('--max_round',       type=int,   default=10)
@@ -125,6 +126,7 @@ NODE_DIM      = args.node_dim
 TIME_DIM      = args.time_dim
 NUM_LAYER     = args.n_layer
 NUM_NEIGHBOR  = args.n_neighbor
+TEMPORAL_STRATEGY = args.temporal_strategy
 N_HEAD        = args.n_head
 MAX_ROUND     = args.max_round
 TOLERANCE     = args.tolerance
@@ -196,10 +198,11 @@ logger.info(f'NeighborLoader fanouts (outer→inner): {num_neighbors}')
 train_loader = NeighborLoader(
     graph,
     num_neighbors = num_neighbors,
+    temporal_strategy = TEMPORAL_STRATEGY,
     batch_size    = BATCH_SIZE,
     input_nodes   = train_idx,
     input_time    = graph.node_time[train_idx],
-    time_attr     = 'time',
+    time_attr     = 'edge_time',
     shuffle       = True,
     num_workers   = NUM_WORKERS,
 )
@@ -207,10 +210,11 @@ train_loader = NeighborLoader(
 val_loader = NeighborLoader(
     graph,
     num_neighbors = num_neighbors,
+    temporal_strategy = TEMPORAL_STRATEGY,
     batch_size    = BATCH_SIZE * 2,
     input_nodes   = val_idx,
     input_time    = graph.node_time[val_idx],
-    time_attr     = 'time',
+    time_attr     = 'edge_time',
     shuffle       = False,
     num_workers   = NUM_WORKERS,
 )
@@ -218,10 +222,11 @@ val_loader = NeighborLoader(
 test_loader = NeighborLoader(
     graph,
     num_neighbors = num_neighbors,
+    temporal_strategy = TEMPORAL_STRATEGY,
     batch_size    = BATCH_SIZE * 2,
     input_nodes   = test_idx,
     input_time    = graph.node_time[test_idx],
-    time_attr     = 'time',
+    time_attr     = 'edge_time',
     shuffle       = False,
     num_workers   = NUM_WORKERS,
 )
@@ -279,7 +284,7 @@ def eval_nodes(loader):
         logits = model(
             x          = batch.x,
             edge_index = batch.edge_index,
-            edge_attr  = batch.edge_attr,
+            time       = batch.edge_time,
             node_time  = batch.node_time,
             batch_size = batch_size,
         )
@@ -332,7 +337,7 @@ with mlflow.start_run():
             logits = model(
                 x          = batch.x,
                 edge_index = batch.edge_index,
-                edge_attr  = batch.edge_attr,
+                time       = batch.edge_time,
                 node_time  = batch.node_time,
                 batch_size = batch_size,
             )
@@ -368,7 +373,7 @@ with mlflow.start_run():
         val_loss_hist.append(val_loss)
         val_auc_hist.append(val_auc)
 
-        if early_stopper.early_stop_check(val_loss):
+        if early_stopper.early_stop_check(val_auc):
             logger.info(f'Early stopping at epoch {epoch}')
             model.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch)))
             break

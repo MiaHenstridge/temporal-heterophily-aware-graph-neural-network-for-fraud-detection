@@ -310,28 +310,26 @@ def load_dgraphfin_temporal(data_dir, fold=0, to_undirected=True):
     # edge timestamps from DGraphFinv2 dataset
     et = torch.tensor(
         np.load(os.path.join(data_dir, 'DGraphFin', 'dgraphfinv2_edge_timestamp.npy')),
-        dtype=torch.float,
-    ).view(-1, 1)                                                  # [E, 1]
+        dtype=torch.long,
+    ).view(-1)                                                  # [E,]
 
     # node timestamps from DGraphFinv2 dataset
-    # foreground nodes: label-assignment timestamp
-    # background nodes: large negative sentinel value
     node_time = torch.tensor(
         np.load(os.path.join(data_dir, 'DGraphFin', 'dgraphfinv2_node_timestamp.npy')),
-        dtype=torch.float,
+        dtype=torch.long,
     )                                                              # [N]
 
     # symmetrise: repeat edge_time and edge_type for both directions (optional)
     if to_undirected:
         edge_index_out = torch.cat([edge_index_directed, edge_index_directed[[1, 0], :]], dim=1)
-        et_out         = torch.cat([et, et], dim=0)                # [2E, 1]
+        et_out         = torch.cat([et, et], dim=0)                # [2E]
         edge_type_out  = torch.cat(
             [data.edge_type, data.edge_type], dim=0
-        ).reshape(-1, 1)                                           # [2E, 1]
+        )                                          # [2E,]
     else:
         edge_index_out = edge_index_directed
-        et_out         = et                                        # [E, 1]
-        edge_type_out  = data.edge_type.reshape(-1, 1)             # [E, 1]
+        et_out         = et                                     # [E]
+        edge_type_out  = data.edge_type                         # [E,]
 
     # split masks
     train_idx = data.train_mask
@@ -348,8 +346,8 @@ def load_dgraphfin_temporal(data_dir, fold=0, to_undirected=True):
     graph = Data(
         x          = data.x,
         edge_index = edge_index_out,
-        edge_attr  = edge_type_out,
-        time       = et_out,
+        edge_attr  = edge_type_out,   # optional/orthogonal to temporal sampling
+        edge_time  = et_out,          # <-- rename to edge_time to avoid confusion
         node_time  = node_time,
         y          = y_binary,
         num_nodes  = N,

@@ -292,7 +292,7 @@ with mlflow.start_run():
         val_loss_hist.append(val_loss)
         val_auc_hist.append(val_auc)
 
-        if early_stopper.early_stop_check(val_loss, ):
+        if early_stopper.early_stop_check(val_loss):
             logger.info(f'Early stopping at epoch {epoch}')
             model.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch) + '.pt'))
             break
