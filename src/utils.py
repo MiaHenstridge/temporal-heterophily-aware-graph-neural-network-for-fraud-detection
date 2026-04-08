@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 
 ### Utility function and class
 class EarlyStopMonitor(object):
@@ -28,3 +29,34 @@ class EarlyStopMonitor(object):
 
         self.epoch_count += 1
         return self.num_round >= self.max_round
+    
+
+def recall_at_top_n_percent(y_true, y_scores, n_percent):
+    """
+    Calculates Recall @ Top N% of predictions.
+    
+    y_true: array-like of actual binary labels (0 or 1)
+    y_scores: array-like of predicted probabilities/scores
+    n_percent: the percentage cutoff (e.g., 10 for top 10%)
+    """
+    # Create a DataFrame for easy sorting
+    df = pd.DataFrame({'true': y_true, 'score': y_scores})
+    
+    # 1. Sort by score in descending order
+    df = df.sort_values(by='score', ascending=False).reset_index(drop=True)
+    
+    # 2. Determine the cutoff index k
+    n_rows = len(df)
+    k = int(np.ceil((n_percent / 100.0) * n_rows))
+    
+    # 3. Identify positives in the top k and total positives
+    tp_k = df['true'].iloc[:k].sum()
+    total_positives = df['true'].sum()
+    
+    # Handle edge case where there are no positives in the dataset
+    if total_positives == 0:
+        return 0.0
+        
+    # 4. Calculate Recall
+    recall = tp_k / total_positives
+    return recall
