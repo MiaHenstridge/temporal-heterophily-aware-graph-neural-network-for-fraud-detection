@@ -34,11 +34,12 @@ class EarlyStopMonitor(object):
 def recall_at_top_n_percent(y_true, y_scores, n_percent):
     """
     Calculates Recall @ Top N% of predictions.
-    
-    y_true: array-like of actual binary labels (0 or 1)
-    y_scores: array-like of predicted probabilities/scores
-    n_percent: the percentage cutoff (e.g., 10 for top 10%)
+    Ensures inputs are 1D to avoid dimensionality errors.
     """
+    # Force inputs to be 1D arrays
+    y_true = np.array(y_true).ravel()
+    y_scores = np.array(y_scores).ravel()
+    
     # Create a DataFrame for easy sorting
     df = pd.DataFrame({'true': y_true, 'score': y_scores})
     
@@ -53,10 +54,7 @@ def recall_at_top_n_percent(y_true, y_scores, n_percent):
     tp_k = df['true'].iloc[:k].sum()
     total_positives = df['true'].sum()
     
-    # Handle edge case where there are no positives in the dataset
     if total_positives == 0:
         return 0.0
         
-    # 4. Calculate Recall
-    recall = tp_k / total_positives
-    return recall
+    return tp_k / total_positives
