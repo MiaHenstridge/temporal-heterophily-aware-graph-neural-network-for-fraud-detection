@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
 from dgraphfin import load_dgraphfin_temporal
-from sampler_core
+import sampler_core
 
 ### Utility function and class
 class EarlyStopMonitor(object):
