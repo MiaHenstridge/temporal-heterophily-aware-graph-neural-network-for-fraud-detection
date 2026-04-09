@@ -16,6 +16,7 @@ from sklearn.metrics import (
     precision_score,
 )
 from torch.utils.data import DataLoader
+from torch_geometric.loader import NeighborLoader
 from models import THEGCNModel
 
 import mlflow
@@ -55,6 +56,12 @@ parser.add_argument('--time_dim',        type=int,   default=100,
 #                     help='number of attention heads in TransformerConv')
 parser.add_argument('--n_neighbor',      type=int,   default=10,
                     help='neighbors sampled per layer in ParallelSampler')
+parser.add_argument('--temporal_strategy', type=str, default='uniform')
+
+# parser.add_argument('--n_max_sample_edges',  type=int,   default=100,
+#                     help="")
+# parser.add_argument('--n_max_hops',          type=int,   default=2,
+#                     help="max hops from target node to sample interactions from")
 
 parser.add_argument('--fold',            type=int,   default=0)
 parser.add_argument('--prefix',          type=str,   default='')
@@ -86,7 +93,7 @@ NODE_DIM      = args.node_dim
 TIME_DIM      = args.time_dim
 NUM_LAYER     = args.n_layer
 NUM_NEIGHBOR  = args.n_neighbor
-# TEMPORAL_STRATEGY = args.temporal_strategy
+TEMPORAL_STRATEGY = args.temporal_strategy
 # N_HEAD        = args.n_head
 MAX_ROUND     = args.max_round
 TOLERANCE     = args.tolerance
@@ -136,8 +143,8 @@ logger.info(f'Train fraud rate: {train_labels_np.mean():.4f}')
 # ─────────────────────────────────────────────────────────────────────────────
 # Load data for sampler
 # ─────────────────────────────────────────────────────────────────────────────
-logger.info("Loading preprocessed data for parallel sampling...")
-sampler_input = load_sampler_data(os.path.join(DA.paths.output_data_tgl, 'dgraphfin_tgl.npz'))
+# logger.info("Loading preprocessed data for parallel sampling...")
+# sampler_input = load_sampler_data(os.path.join(DA.paths.output_data_tgl, 'dgraphfin_tgl.npz'))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,14 +166,52 @@ else:
 
 logger.info(f'NeighborLoader fanouts (outer→inner): {num_neighbors}')
 
-sampler = TemporalSampler(
-    graph_data=sampler_input,
-    num_neighbors=num_neighbors,
-    num_workers=8,
-    num_threads=32,
-    recent=True,
+# sampler = TemporalSampler(
+#     graph_data=sampler_input,
+#     num_neighbors=num_neighbors,
+#     num_workers=8,
+#     num_threads=32,
+#     recent=True,
+# )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data Loader
+# ─────────────────────────────────────────────────────────────────────────────
+train_loader = NeighborLoader(
+    graph,
+    num_neighbors = num_neighbors,
+    temporal_strategy = TEMPORAL_STRATEGY,
+    batch_size    = BATCH_SIZE,
+    input_nodes   = train_idx,
+    input_time    = graph.node_time[train_idx],
+    time_attr     = 'edge_time',
+    shuffle       = True,
+    num_workers   = NUM_WORKERS,
 )
 
+val_loader = NeighborLoader(
+    graph,
+    num_neighbors = num_neighbors,
+    temporal_strategy = TEMPORAL_STRATEGY,
+    batch_size    = BATCH_SIZE * 2,
+    input_nodes   = val_idx,
+    input_time    = graph.node_time[val_idx],
+    time_attr     = 'edge_time',
+    shuffle       = False,
+    num_workers   = NUM_WORKERS,
+)
+
+test_loader = NeighborLoader(
+    graph,
+    num_neighbors = num_neighbors,
+    temporal_strategy = TEMPORAL_STRATEGY,
+    batch_size    = BATCH_SIZE * 2,
+    input_nodes   = test_idx,
+    input_time    = graph.node_time[test_idx],
+    time_attr     = 'edge_time',
+    shuffle       = False,
+    num_workers   = NUM_WORKERS,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model
@@ -205,11 +250,173 @@ scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test sampling strategy
+# Evaluation
 # ─────────────────────────────────────────────────────────────────────────────
-root_nodes = torch.tensor(train_idx, dtype=torch.int32)
-ts = graph['node_time'].to(torch.float32)
 
-blocks = sampler.sample(root_nodes, ts)
+@torch.no_grad()
+def eval_nodes(loader):
+    model.eval()
+    all_preds, all_labels = [], []
 
-print(blocks[-1])
+    for batch in loader:
+        batch      = batch.to(device, non_blocking=True)
+        batch_size = batch.batch_size
+
+        logits = model(
+            x          = batch.x,
+            edge_index = batch.edge_index,
+            time       = batch.edge_time,
+            node_time  = batch.node_time,
+            batch_size = batch_size,
+        )
+        all_preds.append(logits.cpu().numpy())
+        all_labels.append(batch.y[:batch_size].cpu().numpy())
+
+    all_preds  = np.concatenate(all_preds)
+    all_labels = np.concatenate(all_labels)
+
+    scores     = torch.sigmoid(torch.tensor(all_preds)).numpy()
+    pred_label = (scores > 0.5).astype(int)
+
+    auc = roc_auc_score(all_labels, scores)
+    ap  = average_precision_score(all_labels, scores)
+    f1  = f1_score(all_labels, pred_label, zero_division=0)
+    mcc = matthews_corrcoef(all_labels, pred_label)
+    rc  = recall_score(all_labels, pred_label, zero_division=0)
+    pr  = precision_score(all_labels, pred_label, zero_division=0)
+
+    val_loss = torch.nn.BCEWithLogitsLoss()(
+        torch.tensor(all_preds), torch.tensor(all_labels)
+    ).item()
+
+    return auc, ap, f1, mcc, rc, pr, val_loss
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+early_stopper    = EarlyStopMonitor(max_round=MAX_ROUND, higher_better=EARLY_STOP_HIGHER_BETTER, tolerance=TOLERANCE)
+last_saved_epoch = -1
+
+train_loss_hist = []
+val_loss_hist   = []
+val_auc_hist    = []
+
+mlflow.set_experiment(f'thegcn-test')
+with mlflow.start_run():
+    mlflow.log_params(vars(args))
+
+    for epoch in range(NUM_EPOCH):
+        model.train()
+        m_loss = []
+
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
+        for batch in pbar:
+            batch      = batch.to(device, non_blocking=True)
+            batch_size = batch.batch_size
+
+            logits = model(
+                x          = batch.x,
+                edge_index = batch.edge_index,
+                time       = batch.edge_time,
+                node_time  = batch.node_time,
+                batch_size = batch_size,
+            )
+            loss = criterion(logits, batch.y[:batch_size])
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            m_loss.append(loss.item())
+            pbar.set_postfix({'loss': f'{np.mean(m_loss):.4f}'})
+
+        val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, val_loss = eval_nodes(val_loader)
+        scheduler.step(val_auc)
+
+        logger.info(
+            f'Epoch {epoch} | loss: {np.mean(m_loss):.4f} | val_loss: {val_loss:.4f} | '
+            f'val auc: {val_auc:.4f} | val ap: {val_ap:.4f} | '
+            f'val f1: {val_f1:.4f} | val mcc: {val_mcc:.4f} | '
+            f'val recall: {val_rc:.4f} | val precision: {val_pr:.4f}'
+        )
+        mlflow.log_metrics({
+            'loss':          np.mean(m_loss),
+            'val_loss':      val_loss,
+            'val_auc':       val_auc,
+            'val_ap':        val_ap,
+            'val_f1':        val_f1,
+            'val_mcc':       val_mcc,
+            'val_recall':    val_rc,
+            'val_precision': val_pr,
+        }, step=epoch)
+
+        train_loss_hist.append(np.mean(m_loss))
+        val_loss_hist.append(val_loss)
+        val_auc_hist.append(val_auc)
+
+        if early_stopper.early_stop_check(val_auc):
+            logger.info(f'Early stopping at epoch {epoch}')
+            model.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch)))
+            break
+        else:
+            if early_stopper.best_epoch == epoch:
+                prev = get_checkpoint_path(last_saved_epoch)
+                if os.path.exists(prev):
+                    os.remove(prev)
+                torch.save(model.state_dict(), get_checkpoint_path(epoch))
+                last_saved_epoch = epoch
+
+    # ── final test ───────────────────────────────────────────────────────────
+    test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, _ = eval_nodes(test_loader)
+    logger.info(
+        f'Test | auc: {test_auc:.4f} | ap: {test_ap:.4f} | '
+        f'f1: {test_f1:.4f} | mcc: {test_mcc:.4f} | '
+        f'recall: {test_rc:.4f} | precision: {test_pr:.4f}'
+    )
+    mlflow.log_metrics({
+        'test_auc':       test_auc,
+        'test_ap':        test_ap,
+        'test_f1':        test_f1,
+        'test_mcc':       test_mcc,
+        'test_recall':    test_rc,
+        'test_precision': test_pr,
+    })
+
+    torch.save(model.state_dict(), MODEL_SAVE_PATH)
+    logger.info(f'Model saved to {MODEL_SAVE_PATH}')
+
+    # ── training curve ───────────────────────────────────────────────────────
+    epochs_list = list(range(len(train_loss_hist)))
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+
+    color_loss_train = '#e05c5c'
+    color_loss_val   = '#e09c5c'
+    color_auc        = '#5c8de0'
+
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Train Loss', color=color_loss_train)
+    ax1.plot(epochs_list, train_loss_hist, color=color_loss_train, linewidth=2, label='Train Loss')
+    ax1.plot(epochs_list, val_loss_hist,   color=color_loss_val,   linewidth=2, linestyle='--', label='Val Loss')
+    ax1.tick_params(axis='y', labelcolor=color_loss_train)
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('Val AUC', color=color_auc)
+    ax2.plot(epochs_list, val_auc_hist, color=color_auc, linewidth=2, linestyle='--', label='Val AUC')
+    ax2.tick_params(axis='y', labelcolor=color_auc)
+    ax2.set_ylim(0, 1)
+
+    best_ep = early_stopper.best_epoch
+    ax2.axvline(x=best_ep, color='gray', linestyle=':', linewidth=1.5, label=f'Best epoch ({best_ep})')
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
+
+    plt.title('TGAT Node Classification — Training Curve (early stop on val loss)')
+    plt.tight_layout()
+
+    plot_path = f'./saved_models/{args.prefix}-thegcn-test-node-{DATA}-training-curve.png'
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    mlflow.log_artifact(plot_path)
+    logger.info(f'Training curve saved to {plot_path}')

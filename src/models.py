@@ -303,28 +303,28 @@ class TMPConv(MessagePassing):
             torch.nn.Linear(mlp_in//2, 1),
         )
 
-        def forward(
+    def forward(
+        self,
+        x: torch.Tensor,            # [N, in_channels]: node features of target node at time t'
+        edge_index: torch.Tensor,   # [2, E]: sampled interaction edges (src)
+        rel_t_enc: torch.Tensor,    # [E, time_dim]
+    ) -> torch.Tensor:              # [N, in_channels]
+        # propagate calls message() then aggregate with mean
+        agg = self.propagate(edge_index, x=x, rel_t_enc=rel_t_enc)
+        return x + agg # residual connection
+    
+    def message(
             self,
-            x: torch.Tensor,            # [N, in_channels]: node features of target node at time t'
-            edge_index: torch.Tensor,   # [2, E]: sampled interaction edges (src)
-            rel_t_enc: torch.Tensor,    # [E, time_dim]
-        ) -> torch.Tensor:              # [N, in_channels]
-            # propagate calls message() then aggregate with mean
-            agg = self.propagate(edge_index, x=x, rel_t_enc=rel_t_enc)
-            return x + agg # residual connection
-        
-        def message(
-                self,
-                x_i: torch.Tensor,      # [E, in_channels]: source node features
-                x_j: torch.Tensor,      # [E, in_channels]: destination node features
-                rel_t_enc: torch.Tensor # [E, time_dim]
-                ) -> torch.Tensor:          # [E, in_channels]
-            # compute low pass weight p
-            mlp_in = torch.cat([x_i, x_j, rel_t_enc], dim=-1)   # [E, 2*in_channels + time_dim]
-            p = torch.sigmoid(self.mlp(mlp_in))
-            # high pass weight q=1-p
-            q = 1.0 - p
-            return (p-q) * x_i  # signed message
+            x_i: torch.Tensor,      # [E, in_channels]: source node features
+            x_j: torch.Tensor,      # [E, in_channels]: destination node features
+            rel_t_enc: torch.Tensor # [E, time_dim]
+            ) -> torch.Tensor:          # [E, in_channels]
+        # compute low pass weight p
+        mlp_in = torch.cat([x_i, x_j, rel_t_enc], dim=-1)   # [E, 2*in_channels + time_dim]
+        p = torch.sigmoid(self.mlp(mlp_in))
+        # high pass weight q=1-p
+        q = 1.0 - p
+        return (p-q) * x_i  # signed message
 
 
 class SMPConv(MessagePassing):
