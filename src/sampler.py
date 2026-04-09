@@ -148,13 +148,14 @@ def _block_from_tgb(tgb) -> SampledBlock:
     edge_dts = torch.from_numpy(full_dts[n_seeds:].astype(np.float32))
 
     return SampledBlock(
-        nodes = nodes,
-        edge_index=edge_index,
-        eid=eid,
-        ts=edge_ts,
-        dts=edge_dts,
-        seed_ts=n_seeds,
-        n_total=tgb.dim_in,
+        nodes      = nodes,
+        edge_index = edge_index,
+        eid        = eid,
+        ts         = edge_ts,
+        dts        = edge_dts,
+        seed_ts    = seed_ts,
+        n_seeds    = n_seeds,
+        n_total    = tgb.dim_in,
     )
 
 

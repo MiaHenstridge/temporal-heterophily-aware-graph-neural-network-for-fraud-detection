@@ -15,7 +15,7 @@ from sklearn.metrics import (
     recall_score,
     precision_score,
 )
-
+from torch.utils.data import DataLoader
 from models import THEGCNModel
 
 import mlflow
@@ -163,7 +163,53 @@ sampler = TemporalSampler(
     graph_data=sampler_input,
     num_neighbors=num_neighbors,
     num_workers=8,
-    num_threads=8,
+    num_threads=32,
     recent=True,
 )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model
+# ─────────────────────────────────────────────────────────────────────────────
+model = THEGCNModel(
+    in_channels=node_feat_dim,
+    hidden_channels=NODE_DIM,
+    n_smp_layers=NUM_LAYER,
+    time_dim=TIME_DIM,
+    dropout=DROP_OUT
+).to(device)
+
+logger.info(
+    f'THEGCN | TMP layer: 1 | SMP layers: {NUM_LAYER}  |'
+    f'hidden: {NODE_DIM}| time_dim: {TIME_DIM} | '
+    f'params: {sum(p.numel() for p in model.parameters()):,}'
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Loss / optimiser
+# ─────────────────────────────────────────────────────────────────────────────
+
+n_neg = (train_labels_np == 0).sum()
+n_pos = (train_labels_np == 1).sum()
+pw    = float(n_neg) / float(n_pos) if args.pos_weight < 0 else args.pos_weight
+logger.info(f'pos_weight: {pw:.2f}')
+
+pos_weight = torch.tensor([pw], dtype=torch.float, device=device)
+criterion  = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+optimizer  = torch.optim.Adam(
+    model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+)
+scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-5
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test sampling strategy
+# ─────────────────────────────────────────────────────────────────────────────
+root_nodes = torch.tensor(train_idx, dtype=torch.int32)
+ts = graph['node_time'].to(torch.float32)
+
+blocks = sampler.sample(root_nodes, ts)
+
+print(blocks[-1])
