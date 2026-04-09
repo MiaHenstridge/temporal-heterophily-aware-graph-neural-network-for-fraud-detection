@@ -79,7 +79,7 @@ def load_sampler_data(path: str) -> TGLGraphData:
     data = np.load(path)
     return TGLGraphData(
         indptr      = data['indptr'].astype(np.int32),
-        indices     = data['indicies'].astype(np.int32),
+        indices     = data['indices'].astype(np.int32),
         eid         = data['eid'].astype(np.int32),
         ts          = data['ts'].astype(np.float32),
         num_nodes   = int(data['num_nodes']),
