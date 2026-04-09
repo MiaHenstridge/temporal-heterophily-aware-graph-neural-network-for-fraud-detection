@@ -52,16 +52,11 @@ parser.add_argument('--node_dim',        type=int,   default=128,
                     help='hidden dimension (must be divisible by n_head)')
 parser.add_argument('--time_dim',        type=int,   default=100,
                     help='dimension of the sinusoidal time encoding')
-# parser.add_argument('--n_head',          type=int,   default=2,
-#                     help='number of attention heads in TransformerConv')
+
 parser.add_argument('--n_neighbor',      type=int,   default=10,
                     help='neighbors sampled per layer in ParallelSampler')
 parser.add_argument('--temporal_strategy', type=str, default='uniform')
 
-# parser.add_argument('--n_max_sample_edges',  type=int,   default=100,
-#                     help="")
-# parser.add_argument('--n_max_hops',          type=int,   default=2,
-#                     help="max hops from target node to sample interactions from")
 
 parser.add_argument('--fold',            type=int,   default=0)
 parser.add_argument('--prefix',          type=str,   default='')
