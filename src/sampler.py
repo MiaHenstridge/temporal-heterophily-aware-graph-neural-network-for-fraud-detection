@@ -205,8 +205,32 @@ class TemporalSampler:
 
         threads_per_worker = max(1, num_threads // num_workers)
 
-        # build the C++ sampler
-        # num_history=1, window_duration=0 -> TGAT-style (sample all events before t)
+        # ── dtype guards ─────────────────────────────────────────────────────────
+        # The C++ ParallelSampler uses int (32-bit) for node/edge ids and
+        # float (32-bit) for timestamps. If numpy arrays are wrong dtype,
+        # pybind11 passes the raw bytes unchecked → silent wrong values or
+        # segfault inside C++ vector constructor on large arrays.
+        assert graph_data.indptr.dtype  == np.int32,   "indptr must be int32"
+        assert graph_data.indices.dtype == np.int32,   "indices must be int32"
+        assert graph_data.eid.dtype     == np.int32,   "eid must be int32"
+        assert graph_data.ts.dtype      == np.float32, "ts must be float32"
+
+        # ── thread count guard ────────────────────────────────────────────────
+        # OMP segfaults if num_threads > physical cores on some systems.
+        import multiprocessing
+        max_cores = multiprocessing.cpu_count()
+        if num_threads > max_cores:
+            import warnings
+            warnings.warn(
+                f"num_threads={num_threads} > cpu_count={max_cores}. "
+                f"Clamping to {max_cores} to avoid OMP segfault."
+            )
+            num_threads = max_cores
+            threads_per_worker = max(1, num_threads // num_workers)
+
+        # ── build C++ sampler ─────────────────────────────────────────────────
+        # num_history=1, window_duration=0 → TGAT-style: sample all events
+        # strictly before the query timestamp t.
         self._sampler = sampler_core.ParallelSampler(
             graph_data.indptr.tolist(),
             graph_data.indices.tolist(),
@@ -218,8 +242,8 @@ class TemporalSampler:
             num_neighbors,
             recent,
             prop_time,
-            1,                              # num_history (1=TGAT-style)
-            0.0,                            # window_duration (unseen when num_history=1)
+            1,      # num_history=1 → TGAT-style
+            0.0,    # window_duration unused when num_history=1
         )
 
     
@@ -250,14 +274,20 @@ class TemporalSampler:
             For THEGCN forward pass use blocks[-1] (the direct-neighbour block)
             for TMP and subsequently pass blocks[0...-1] to the SMP layers.
         """
+        # Convert to plain Python lists of the exact C++ expected types.
+        # int32 → matches NodeIDType=int in C++
+        # float32 → matches TimeStampType=float in C++
         root_nodes = seed_nodes.cpu().numpy().astype(np.int32).tolist()
         root_ts    = seed_ts.cpu().numpy().astype(np.float32).tolist()
- 
+
+        if len(root_nodes) == 0:
+            return []
+
         self._sampler.sample(root_nodes, root_ts)
         raw_blocks = self._sampler.get_ret()
- 
-        # raw_blocks has length num_layers * num_history (= num_layers for history=1)
-        # Order: outermost hop first.
+
+        # raw_blocks length = num_layers * num_history (= num_layers for history=1)
+        # Order: outermost hop first → innermost (seed-adjacent) last.
         return [_block_from_tgb(b) for b in raw_blocks]
 
     def __repr__(self):

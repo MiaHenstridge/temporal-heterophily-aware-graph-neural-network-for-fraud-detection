@@ -1,5 +1,7 @@
 import numpy as np
 import pandas as pd
+import torch
+import dgl
 # from scipy.sparse import csr_matrix
 # from dgraphfin import load_dgraphfin_temporal
 # import sampler_core
@@ -63,39 +65,13 @@ def recall_at_top_n_percent(y_true, y_scores, n_percent):
     return tp_k / total_positives
 
 
-# # create CSR arrays for C++ event sampler for THEGCN
-# def create_sampler_inputs(graph_data):
-#     """
-#     Takes the Data object returned by load_dgraphfin_temporal and 
-#     creates the CSR arrays needed for the C++ event sampler.
-#     """
-#     # extract raw tensors from the Data object
-#     edge_index = graph_data.edge_index.numpy()
-#     edge_time = graph_data.edge_time.numpy()
-#     num_nodes = graph_data.x.size(0)
+# load tgl graph (edges.csv and ext_full.npz)
+def load_graph(data_dir):
+    df = pd.read_csv(f'{data_dir}/edges.csv')
+    g = np.load('{data_dir}/ext_full.npz')
+    return g, df
 
-#     # sort edges by dst and time
-#     # the C++ sampler expects neighbors of a node to be chronologically ordered.
-#     sort_idx = np.lexsort((edge_time, edge_index[1]))
 
-#     src_sorted = edge_index[0][sort_idx]
-#     dst_sorted = edge_index[1][sort_idx]
-#     time_sorted = edge_time[sort_idx]
-
-#     # create edge ids matching the new sorted order
-#     edge_ids = np.arange(len(edge_time), dtype=np.int32)[sort_idx]
-
-#     # build csr arrays 
-#     # use a dummy array for values just to generate indptr and indices
-#     dummy_values = np.ones(len(src_sorted))
-#     adj_csr = csr_matrix((dummy_values, (src_sorted, dst_sorted)), shape=(num_nodes, num_nodes))
-
-#     # extract arrays for the C++ sampler constructor
-#     indptr = adj_csr.indptr.astype(np.int32)
-#     indices = adj_csr.indicies.astype(np.int32)
-#     ts = time_sorted.astype(np.float64)
-
-#     return indptr, indices, edge_ids, ts
 
 
 

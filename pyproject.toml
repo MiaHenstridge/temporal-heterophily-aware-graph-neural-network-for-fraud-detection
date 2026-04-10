@@ -3,11 +3,12 @@ name = "pyg-uv-env"
 version = "0.1.0"
 description = "GNN Research Environment"
 readme = "README.md"
-requires-python = "==3.12.*"
+requires-python = "==3.11.*"
 dependencies = [
-    "torch==2.6.0",
+    "torch==2.4.0",
     "torchvision",
     "torchaudio",
+    "dgl",
     "pyg-lib",
     "torch-scatter",
     "torch-sparse",
@@ -25,20 +26,23 @@ dependencies = [
     "notebook",
     "ipykernel",
     "optuna",
-    "pybind11 >= 2.6.2"
+    "pybind11>=2.6.2",
 ]
 
 [[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
+[tool.uv]
+find-links = ["https://data.dgl.ai/wheels/torch-2.4/cu124/repo.html"]
+
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu126" }]
-torchvision = [{ index = "pytorch-cu126" }]
-torchaudio = [{ index = "pytorch-cu126" }]
-pyg-lib = [{ url = "https://data.pyg.org/whl/torch-2.6.0+cu126/pyg_lib-0.5.0+pt26cu126-cp312-cp312-linux_x86_64.whl" }]
-torch-scatter = [{ url = "https://data.pyg.org/whl/torch-2.6.0%2Bcu126/torch_scatter-2.1.2%2Bpt26cu126-cp312-cp312-linux_x86_64.whl" }]
-torch-sparse = [{ url = "https://data.pyg.org/whl/torch-2.6.0%2Bcu126/torch_sparse-0.6.18%2Bpt26cu126-cp312-cp312-linux_x86_64.whl" }]
-torch-cluster = [{ url = "https://data.pyg.org/whl/torch-2.6.0%2Bcu126/torch_cluster-1.6.3%2Bpt26cu126-cp312-cp312-linux_x86_64.whl" }]
-torch-spline-conv = [{ url = "https://data.pyg.org/whl/torch-2.6.0%2Bcu126/torch_spline_conv-1.2.2%2Bpt26cu126-cp312-cp312-linux_x86_64.whl" }]
+torch = [{ index = "pytorch-cu124" }]
+torchvision = [{ index = "pytorch-cu124" }]
+torchaudio = [{ index = "pytorch-cu124" }]
+pyg-lib = { url = "https://data.pyg.org/whl/torch-2.4.0+cu124/pyg_lib-0.4.0+pt24cu124-cp311-cp311-linux_x86_64.whl" }
+torch-scatter = { url = "https://data.pyg.org/whl/torch-2.4.0+cu124/torch_scatter-2.1.2+pt24cu124-cp311-cp311-linux_x86_64.whl" }
+torch-sparse = { url = "https://data.pyg.org/whl/torch-2.4.0+cu124/torch_sparse-0.6.18+pt24cu124-cp311-cp311-linux_x86_64.whl" }
+torch-cluster = { url = "https://data.pyg.org/whl/torch-2.4.0+cu124/torch_cluster-1.6.3+pt24cu124-cp311-cp311-linux_x86_64.whl" }
+torch-spline-conv = { url = "https://data.pyg.org/whl/torch-2.4.0+cu124/torch_spline_conv-1.2.2+pt24cu124-cp311-cp311-linux_x86_64.whl" }
