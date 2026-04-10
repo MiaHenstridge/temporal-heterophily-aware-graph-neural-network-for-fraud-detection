@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from torch_geometric.nn import SAGEConv, GATConv, GATv2Conv, TransformerConv
+from torch_geometric.nn import SAGEConv, GATConv, GATv2Conv, TransformerConv, FAConv
 from torch_geometric.nn import MessagePassing
 import numpy as np
 
@@ -110,6 +110,76 @@ class GATv2Model(torch.nn.Module):
         for conv, norm in zip(self.convs, self.norms):
             h = norm(conv(h, edge_index).relu())
             h = F.dropout(h, p=self.dropout, training=self.training)
+        return self.clf(h[:batch_size]).squeeze(-1)
+    
+
+class FAGCNModel(torch.nn.Module):
+    """
+    Frequency Adaptive Graph Convolution Network (FAGCN).
+    Bo et al., "Beyond Low-Frequency Information in Graph Convolutional Networks"
+    AAAI 2021.
+ 
+    FAConv computes signed, adaptive attention weights α ∈ (-1, 1) via tanh,
+    allowing it to capture both low-frequency (homophilic) and high-frequency
+    (heterophilic) signals depending on the graph structure.
+ 
+    Update rule per layer:
+        x'_i = ε · x_0_i  +  Σ_{j∈N(i)}  α_ij / √(d_i·d_j)  · x_j
+    where x_0 is the initial feature (residual connection to input),
+    ε is a learnable scalar, and α_ij = tanh(a^T [x_i || x_j]).
+ 
+    Parameters
+    ----------
+    in_channels : int
+    hidden_channels : int
+    n_layers : int
+    dropout : float
+    eps : float
+        Initial value of the ε residual weight (default 0.1).
+    """
+ 
+    def __init__(self, in_channels, hidden_channels, n_layers, dropout, eps=0.1):
+        super().__init__()
+        self.dropout = dropout
+        self.convs   = torch.nn.ModuleList()
+        self.norms   = torch.nn.ModuleList()
+ 
+        # FAConv requires same in/out channels (it only aggregates, no projection).
+        # Use an input linear layer to project in_channels → hidden_channels first,
+        # then all FAConv layers operate at hidden_channels.
+        self.input_proj = torch.nn.Linear(in_channels, hidden_channels)
+ 
+        for _ in range(n_layers):
+            # channels = hidden_channels (both input and output are same dim)
+            # cached=False: required for mini-batch / inductive setting
+            self.convs.append(FAConv(hidden_channels, eps=eps, dropout=dropout,
+                                     cached=False, add_self_loops=True))
+            self.norms.append(torch.nn.BatchNorm1d(hidden_channels))
+ 
+        self.clf = torch.nn.Sequential(
+            torch.nn.Linear(hidden_channels, hidden_channels),
+            torch.nn.BatchNorm1d(hidden_channels),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_channels, hidden_channels // 2),
+            torch.nn.BatchNorm1d(hidden_channels // 2),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_channels // 2, 1),
+        )
+ 
+    def forward(self, x, edge_index, batch_size):
+        # Project to hidden dim and store as x_0 (initial residual for all layers)
+        x_0 = F.relu(self.input_proj(x))     # [N, hidden]
+        h   = x_0
+ 
+        for conv, norm in zip(self.convs, self.norms):
+            # FAConv.forward(x, x_0, edge_index)
+            # x   : current node embeddings
+            # x_0 : initial node embeddings (residual anchor, fixed across layers)
+            h = norm(conv(h, x_0, edge_index).relu())
+            h = F.dropout(h, p=self.dropout, training=self.training)
+ 
         return self.clf(h[:batch_size]).squeeze(-1)
     
 
@@ -300,7 +370,7 @@ class TMPConv(MessagePassing):
         self.mlp = torch.nn.Sequential(
             torch.nn.Linear(mlp_in, mlp_in//2),
             torch.nn.ReLU(),
-            torch.nn.Linear(mlp_in//2, 1),
+            torch.nn.Linear(mlp_in//2, in_channels),
         )
 
     def forward(
@@ -345,7 +415,7 @@ class SMPConv(MessagePassing):
         self.mlp = torch.nn.Sequential(
             torch.nn.Linear(mlp_in, mlp_in//2),
             torch.nn.ReLU(),
-            torch.nn.Linear(mlp_in//2, 1),
+            torch.nn.Linear(mlp_in//2, hidden_channels),
         )
 
     def forward(

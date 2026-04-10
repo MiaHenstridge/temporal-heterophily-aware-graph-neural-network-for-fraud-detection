@@ -54,7 +54,7 @@ parser.add_argument('--time_dim',        type=int,   default=100,
                     help='dimension of the sinusoidal time encoding')
 
 parser.add_argument('--n_neighbor',      type=int,   default=10,
-                    help='neighbors sampled per layer in ParallelSampler')
+                    help='neighbors sampled per layer')
 parser.add_argument('--temporal_strategy', type=str, default='uniform')
 
 
@@ -153,12 +153,13 @@ device = torch.device(f'cuda:{GPU}' if torch.cuda.is_available() else 'cpu')
 # ─────────────────────────────────────────────────────────────────────────────
 if NUM_LAYER == 1:
     num_neighbors = [NUM_NEIGHBOR]
-elif NUM_LAYER == 2:
-    num_neighbors = [NUM_NEIGHBOR, 5]
+# elif NUM_LAYER == 2:
+#     num_neighbors = [NUM_NEIGHBOR, 5]
 else:
-    step = max(1, (NUM_NEIGHBOR - 5) // (NUM_LAYER - 1))
-    num_neighbors = [max(5, NUM_NEIGHBOR - i * step) for i in range(NUM_LAYER)]
-
+    # step = max(1, (NUM_NEIGHBOR - 5) // (NUM_LAYER - 1))
+    # num_neighbors = [max(5, NUM_NEIGHBOR - i * step) for i in range(NUM_LAYER)]
+    num_neighbors = [NUM_NEIGHBOR] * NUM_LAYER
+    
 logger.info(f'NeighborLoader fanouts (outer→inner): {num_neighbors}')
 
 # sampler = TemporalSampler(
