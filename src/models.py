@@ -531,3 +531,114 @@ class THEGCNModel(torch.nn.Module):
         # classify seed nodes only
         return self.clf(h[:batch_size]).squeeze(-1)               # [batch size]
     
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THEGCN with TGL Parallel Sampler
+# ─────────────────────────────────────────────────────────────────────────────
+class THEGCNSamplerModel(torch.nn.Module):
+    """
+    THEGCN variant that accepts pre-sampled batch_inputs from the TGL C++
+    ParallelSampler via to_dgl_blocks + to_pyg_inputs.
+ 
+    Compared to THEGCNModel:
+    - dts (Δt per edge) is provided directly from the sampler — no need to
+      recompute rel_t inside the model.
+    - node features are looked up from the global x_all matrix using node_ids
+      returned by the sampler, so x is not passed directly.
+    - Works with HISTORY=1 (TGAT-style, one temporal snapshot per layer).
+ 
+    Parameters
+    ----------
+    in_channels : int
+    hidden_channels : int
+    n_smp_layers : int
+        Number of SMP layers (L in paper). 0 = TMP only.
+    time_dim : int
+    dropout : float
+    """
+ 
+    def __init__(
+        self,
+        in_channels:     int,
+        hidden_channels: int,
+        n_smp_layers:    int,
+        time_dim:        int,
+        dropout:         float = 0.2,
+    ):
+        super().__init__()
+        self.time_enc     = TimeEncode(time_dim)
+        self.dropout      = dropout
+        self.n_smp_layers = n_smp_layers
+ 
+        # TMP block: operates on raw node features
+        self.tmp = TMPConv(in_channels=in_channels, time_dim=time_dim)
+ 
+        # Linear projection: in_channels → hidden_channels before SMP
+        self.input_proj = torch.nn.Linear(in_channels, hidden_channels)
+ 
+        # SMP block: L layers of static heterophily-aware message passing
+        self.smp_convs = torch.nn.ModuleList([
+            SMPConv(hidden_channels) for _ in range(n_smp_layers)
+        ])
+        self.smp_norms = torch.nn.ModuleList([
+            torch.nn.BatchNorm1d(hidden_channels) for _ in range(n_smp_layers)
+        ])
+ 
+        # Classifier MLP — same structure as static GNN baselines
+        self.clf = torch.nn.Sequential(
+            torch.nn.Linear(hidden_channels, hidden_channels),
+            torch.nn.BatchNorm1d(hidden_channels),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_channels, hidden_channels // 2),
+            torch.nn.BatchNorm1d(hidden_channels // 2),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_channels // 2, 1),
+        )
+ 
+    def forward(
+        self,
+        x_all:       torch.Tensor,   # [N_total, in_channels]  full node feature matrix on device
+        batch_inputs: list,           # output of to_pyg_inputs(mfgs)
+        batch_size:  int,             # number of seed nodes
+    ) -> torch.Tensor:               # [batch_size] logits
+ 
+        # batch_inputs[layer][hist=0] = dict with node_ids, edge_index, edge_dts
+        # innermost layer = batch_inputs[-1][0]
+        inner = batch_inputs[-1][0]
+ 
+        node_ids   = inner['node_ids']    # [N_sub]  global node ids
+        edge_index = inner['edge_index']  # [2, E]   local index space
+        dts        = inner['edge_dts']    # [E]      Δt = query_ts[dst] - edge_ts
+ 
+        # Look up node features from global matrix
+        x = x_all[node_ids]              # [N_sub, in_channels]
+ 
+        # ── time encoding ─────────────────────────────────────────────────────
+        # dts is already Δt per edge from the TGL sampler — feed directly to
+        # TimeEncode. Unsqueeze to [E, 1] for TimeEncode's [N, L] input format.
+        rel_t_enc = self.time_enc(dts.float().unsqueeze(1)).squeeze(1)  # [E, time_dim]
+ 
+        # ── TMP block (Eq. 4-5) ──────────────────────────────────────────────
+        h = self.tmp(x, edge_index, rel_t_enc)                          # [N_sub, in_channels]
+        h = F.dropout(h, p=self.dropout, training=self.training)
+ 
+        # ── project to hidden dim ─────────────────────────────────────────────
+        h = F.relu(self.input_proj(h))                                  # [N_sub, hidden]
+ 
+        # ── SMP block (Eq. 6-7) ──────────────────────────────────────────────
+        # Reuses the same edge_index (topology fixed after TMP).
+        # For multi-hop models, outer layers could use batch_inputs[:-1]
+        # but for simplicity and following the paper we use the same subgraph.
+        for conv, norm in zip(self.smp_convs, self.smp_norms):
+            h = norm(F.relu(conv(h, edge_index)))
+            h = F.dropout(h, p=self.dropout, training=self.training)
+ 
+        # ── classify seed nodes only ──────────────────────────────────────────
+        # Seed nodes are dst nodes in the DGL block, which to_pyg_inputs places
+        # at positions 0..batch_size-1 in the destination ordering.
+        # DGL block: dst nodes come first in srcdata['ID'], so h[:batch_size]
+        # corresponds to the seed nodes.
+        return self.clf(h[:batch_size]).squeeze(-1)                     # [batch_size]
+ 

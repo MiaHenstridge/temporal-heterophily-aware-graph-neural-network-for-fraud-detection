@@ -36,42 +36,6 @@ class EarlyStopMonitor(object):
         self.epoch_count += 1
         return self.num_round >= self.max_round
 
-
-class FocalLoss(torch.nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
-        """
-        Binary Focal Loss
-        FL(p_t) = -alpha * (1 - p_t)^gamma * log(p_t)
-        
-        Args:
-            alpha (float): Balancing factor for the rare class (fraud).
-            gamma (float): Focusing parameter. Higher values focus more on hard samples.
-            reduction (str): 'mean', 'sum', or 'none'.
-        """
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-
-    def forward(self, inputs, targets):
-        # inputs are logits, targets are 0 or 1
-        p = torch.sigmoid(inputs)
-        ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-        
-        # p_t is the probability of the true class
-        p_t = p * targets + (1 - p) * (1 - targets)
-        loss = ce_loss * ((1 - p_t) ** self.gamma)
-
-        if self.alpha >= 0:
-            alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
-            loss = alpha_t * loss
-
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        else:
-            return loss
     
 # function for recall@topk%
 def recall_at_top_n_percent(y_true, y_scores, n_percent):
@@ -106,10 +70,71 @@ def recall_at_top_n_percent(y_true, y_scores, n_percent):
 # load tgl graph (edges.csv and ext_full.npz)
 def load_graph(data_dir):
     df = pd.read_csv(f'{data_dir}/edges.csv')
-    g = np.load('{data_dir}/ext_full.npz')
+    g = np.load(f'{data_dir}/ext_full.npz')
     return g, df
 
 
+def to_dgl_blocks(ret, hist, reverse=False, cuda=True):
+    mfgs = list()
+    for r in ret:
+        if not reverse:
+            b = dgl.create_block((r.col(), r.row()), num_src_nodes=r.dim_in(), num_dst_nodes=r.dim_out())
+            b.srcdata['ID'] = torch.from_numpy(r.nodes())
+            b.edata['dt'] = torch.from_numpy(r.dts())[b.num_dst_nodes():]
+            b.srcdata['ts'] = torch.from_numpy(r.ts())
+        else:
+            b = dgl.create_block((r.row(), r.col()), num_src_nodes=r.dim_out(), num_dst_nodes=r.dim_in())
+            b.dstdata['ID'] = torch.from_numpy(r.nodes())
+            b.edata['dt'] = torch.from_numpy(r.dts())[b.num_src_nodes():]
+            b.dstdata['ts'] = torch.from_numpy(r.ts())
+        b.edata['ID'] = torch.from_numpy(r.eid())
+        if cuda:
+            mfgs.append(b.to('cuda:0'))
+        else:
+            mfgs.append(b)
+    mfgs = list(map(list, zip(*[iter(mfgs)] * hist)))
+    mfgs.reverse()
+    return mfgs
+
+
+def to_pyg_inputs(mfgs, device='cuda'):
+    """
+    Converts DGL MFGs from to_dgl_blocks into a structure of torch.Tensors.
+    
+    Args:
+        mfgs (list): Nested list from to_dgl_blocks [[layer2, layer1], ...]
+        device (str): Target device ('cuda' or 'cpu')
+        
+    Returns:
+        List of lists where each element is a dictionary containing 
+        torch.Tensor versions of edge_index, node_ids, and edge_dts.
+    """
+    pyg_inputs = []
+    
+    for history_step in mfgs:
+        step_data = []
+        for block in history_step:
+            # 1. Construct Edge Index [2, E]
+            # u (source/neighbors), v (destination/targets)
+            u, v = block.edges()
+            edge_index = torch.stack([u, v], dim=0).to(device)
+            
+            # 2. Extract and ensure Tensors for all metadata
+            node_ids = block.srcdata['ID'].to(device)
+            edge_dts = block.edata['dt'].to(device)
+            edge_ids = block.edata['ID'].to(device)
+            
+            # 3. Package as a dictionary of Tensors
+            step_data.append({
+                'edge_index': edge_index,
+                'node_ids': node_ids,
+                'edge_dts': edge_dts,
+                'edge_ids': edge_ids,
+                'size': (block.num_src_nodes(), block.num_dst_nodes())
+            })
+        pyg_inputs.append(step_data)
+        
+    return pyg_inputs
 
 
 

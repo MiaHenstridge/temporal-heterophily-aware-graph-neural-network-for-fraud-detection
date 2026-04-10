@@ -45,7 +45,7 @@ if __name__ == '__main__':
     args=parser.parse_args()
 
     df = pd.read_csv(os.path.join(DA.paths.output_data_tgl, 'edges.csv'))
-    g = np.load(os.path.join(DA.paths.output_data_tgl, 'ext_full.npz'))
+    g = np.load(os.path.join(DA.paths.output_data_tgl, 'int_train.npz'))
 
     # num_neighbors per layer: outer → inner, linearly decreasing
     if args.n_layer == 0:
@@ -82,9 +82,13 @@ if __name__ == '__main__':
     uni_time = 0
     total_nodes = 0
     unique_nodes = 0
-    for _, rows in tqdm(df.groupby(df.index // args.batch_size), total=len(df) // args.batch_size):
-        root_nodes = np.concatenate([rows.src.values, rows.dst.values, neg_link_sampler.sample(len(rows))]).astype(np.int32)
-        ts = np.concatenate([rows.time.values, rows.time.values, rows.time.values]).astype(np.float32)
+
+
+    df_train = df[df['ext_roll']==0].copy().reset_index()
+
+    for _, rows in tqdm(df_train.groupby(df_train.index // args.batch_size), total=len(df_train) // args.batch_size):
+        root_nodes = np.concatenate([rows.src.values, rows.dst.values]).astype(np.int32)
+        ts = np.concatenate([rows.time.values, rows.time.values]).astype(np.float32)
         sampler.sample(root_nodes, ts)
         ret = sampler.get_ret()
         tot_time += ret[0].tot_time()

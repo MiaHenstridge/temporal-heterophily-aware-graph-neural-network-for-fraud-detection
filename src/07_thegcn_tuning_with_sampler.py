@@ -55,11 +55,12 @@ faulthandler.enable()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import THEGCNModel
-from utils import EarlyStopMonitor
+from models import THEGCNModel, THEGCNSamplerModel
+from utils import *
 from namespaces import DA
 from dgraphfin import load_dgraphfin_temporal
-from sampler import TemporalSampler, load_sampler_data
+# from sampler import TemporalSampler, load_sampler_data
+from sampler_core import ParallelSampler, TemporalGraphBlock
 
 os.makedirs(DA.paths.log,          exist_ok=True)
 os.makedirs('./saved_models',      exist_ok=True)
@@ -72,8 +73,8 @@ os.makedirs('./saved_checkpoints', exist_ok=True)
 parser = argparse.ArgumentParser('THEGCN Node Classification on DGraphFin (TGL sampler)')
 parser.add_argument('-d', '--data',       type=str,   default='DGraphFin')
 parser.add_argument('--data_dir',         type=str,   default='./datasets')
-parser.add_argument('--sampler_data',     type=str,   default='./processed_data/tgl/ext_full.npz',
-                    help='Path to CSC graph .npz built by prepare_sampler_data.py')
+parser.add_argument('--sampler_dir',     type=str,   default='./processed_data/tgl',
+                    help='Path to CSC graph .npz built by tgl_data_preprocess.py')
 parser.add_argument('--bs',               type=int,   default=1024)
 parser.add_argument('--n_epoch',          type=int,   default=100)
 parser.add_argument('--lr',               type=float, default=1e-3)
@@ -85,12 +86,23 @@ parser.add_argument('--node_dim',         type=int,   default=128,
                     help='Hidden dimension for SMP layers and classifier.')
 parser.add_argument('--time_dim',         type=int,   default=100,
                     help='Dimension of sinusoidal time encoding.')
-parser.add_argument('--n_neighbor',       type=int,   default=10,
-                    help='Neighbours sampled per layer.')
+
 parser.add_argument('--num_threads',      type=int,   default=8,
                     help='Total OMP threads for C++ sampler.')
 parser.add_argument('--num_workers',      type=int,   default=1,
                     help='Number of sampler workers (num_thread_per_worker = num_threads // num_workers).')
+
+parser.add_argument('--n_neighbor',       type=int,   default=10,
+                    help='Neighbours sampled per layer.')
+parser.add_argument('--strategy',         type=str, default='uniform',  
+                    help="'recent' that samples most recent neighbors or 'uniform' that uniformly samples neighbors form the past")
+parser.add_argument('--prop_time',        action='store_true', default=False, 
+                    help="whether to use the timestamp of the root nodes when sampling for their multi-hop neighbors. Default stored as False")
+parser.add_argument('--history',          type=int, default=1, 
+                    help="number of snapshots to sample on")
+parser.add_argument('--duration',         type=float, default=0.0, 
+                    help="length in time of each snapshot, 0 for infinite length (used in non-snapshot-based methods")
+
 parser.add_argument('--fold',             type=int,   default=0)
 parser.add_argument('--prefix',           type=str,   default='')
 parser.add_argument('--max_round',        type=int,   default=10)
@@ -100,6 +112,7 @@ parser.add_argument('--pos_weight',       type=float, default=100,
 parser.add_argument('--weight_decay',     type=float, default=5e-7)
 parser.add_argument('--to_undirected',    action='store_true', default=False)
 parser.add_argument('--early_stop_higher_better', action='store_true', default=False)
+
 
 try:
     args = parser.parse_args()
@@ -113,19 +126,26 @@ LEARNING_RATE = args.lr
 DROP_OUT      = args.drop_out
 GPU           = args.gpu
 DATA          = args.data
+
 NODE_DIM      = args.node_dim
 TIME_DIM      = args.time_dim
 NUM_LAYER     = args.n_layer
 NUM_NEIGHBOR  = args.n_neighbor
+STRATEGY      = args.strategy
+PROP_TIME     = args.prop_time
+HISTORY       = args.history
+DURATION      = args.duration
+
 NUM_THREADS   = args.num_threads
 NUM_WORKERS   = args.num_workers
+
 MAX_ROUND     = args.max_round
 TOLERANCE     = args.tolerance
 WEIGHT_DECAY  = args.weight_decay
 EARLY_STOP_HIGHER_BETTER = args.early_stop_higher_better
 
-MODEL_SAVE_PATH     = f'./saved_models/{args.prefix}-thegcn-node-{DATA}.pth'
-get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{args.prefix}-thegcn-node-{DATA}-{epoch}.pt'
+MODEL_SAVE_PATH     = f'./saved_models/{args.prefix}-thegcn-with-sampler-node-{DATA}.pth'
+get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{args.prefix}-thegcn-with-sampler-node-{DATA}-{epoch}.pt'
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logger
@@ -154,13 +174,13 @@ logger.info(args)
     to_undirected = args.to_undirected,
 )
 
-# Fix background node sentinels in node_time:
-# background nodes have large negative timestamps → replace with global max
-# so rel_t = node_time[dst] - edge_time is never a garbage large negative
-max_ts = graph.edge_time.float().max().item()
-node_time = graph.node_time.clone().float()
-node_time[node_time < 0] = max_ts
-graph.node_time = node_time
+# # Fix background node sentinels in node_time:
+# # background nodes have large negative timestamps → replace with global max
+# # so rel_t = node_time[dst] - edge_time is never a garbage large negative
+# max_ts = graph.edge_time.float().max().item()
+# node_time = graph.node_time.clone().float()
+# node_time[node_time < 0] = max_ts
+# graph.node_time = node_time
 
 # Full node feature matrix and labels on CPU (indexed by global node id)
 x_all         = graph.x                # [N, node_feat_dim]
@@ -171,7 +191,7 @@ logger.info(
     f'Graph: {graph.num_nodes:,} nodes | {graph.num_edges:,} edges'
 )
 logger.info(
-    f'Train: {len(train_idx):,} | Val: {len(val_idx):,} | Test: {len(test_idx):,}'
+    f'Train: {len(train_idx):,} | Val: {len(val_idx):,} | Test: {len(test_idx):,} | Background: {x_all.shape[0] - (len(train_idx) + len(val_idx) + len(test_idx)):,}'
 )
 logger.info(f'Train fraud rate: {train_labels_np.mean():.4f}')
 
@@ -179,8 +199,10 @@ logger.info(f'Train fraud rate: {train_labels_np.mean():.4f}')
 # Load CSC sampler data and build TemporalSampler
 # ─────────────────────────────────────────────────────────────────────────────
 
-logger.info(f'Loading CSC sampler data from {args.sampler_data}...')
-graph_data = load_sampler_data(args.sampler_data)
+logger.info(f'Loading CSC sampler data from {args.sampler_dir}...')
+g, df = load_graph(args.sampler_dir)
+
+assert len(g['indptr']) == x_all.shape[0] + 1
 
 # num_neighbors per layer: outer → inner, linearly decreasing
 if NUM_LAYER == 0:
@@ -193,22 +215,22 @@ else:
     step = max(1, (NUM_NEIGHBOR - 5) // (NUM_LAYER - 1))
     num_neighbors = [max(5, NUM_NEIGHBOR - i * step) for i in range(NUM_LAYER)]
 
-# For TMP we always need at least 1 hop of neighbours regardless of n_layer
-# The TMP block uses the innermost block (blocks[-1]) from the sampler.
-# If n_layer=0 (TMP only), we still need one sampling layer for TMP.
-tmp_neighbors  = num_neighbors if NUM_LAYER > 0 else [NUM_NEIGHBOR]
-n_sample_layers = max(NUM_LAYER, 1)   # always sample at least 1 hop for TMP
-
-sampler = TemporalSampler(
-    graph_data    = graph_data,
-    num_neighbors = tmp_neighbors if NUM_LAYER > 0 else [NUM_NEIGHBOR],
-    num_workers   = NUM_WORKERS,
-    num_threads   = NUM_THREADS,
-    recent        = True,    # pick most-recent N neighbours (TGAT style)
-    prop_time     = False,   # use actual edge timestamps (not propagated root ts)
+sampler = ParallelSampler(
+    g['indptr'], 
+    g['indices'], 
+    g['eid'], 
+    g['ts'].astype(np.float32),
+    NUM_THREADS, 
+    NUM_WORKERS,                               # num_workers
+    NUM_LAYER, 
+    num_neighbors,
+    STRATEGY=='recent', 
+    PROP_TIME,
+    HISTORY, 
+    float(DURATION)
 )
 logger.info(f'Sampler: {sampler}')
-logger.info(f'Sampler fanouts: {tmp_neighbors}')
+logger.info(f'NeighborLoader fanouts (outer→inner): {num_neighbors}')
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Device
@@ -223,7 +245,7 @@ y_all         = y_all.to(device)
 # Model
 # ─────────────────────────────────────────────────────────────────────────────
 
-model = THEGCNModel(
+model = THEGCNSamplerModel(
     in_channels     = node_feat_dim,
     hidden_channels = NODE_DIM,
     n_smp_layers    = NUM_LAYER,
@@ -255,35 +277,35 @@ scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-5
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: build mini-batch tensors from a SampledBlock
-# ─────────────────────────────────────────────────────────────────────────────
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Helper: build mini-batch tensors from a SampledBlock
+# # ─────────────────────────────────────────────────────────────────────────────
 
-def block_to_tensors(blocks):
-    """
-    Convert list of SampledBlock (one per sampler layer) into tensors for
-    THEGCNModel.forward().
+# def block_to_tensors(blocks):
+#     """
+#     Convert list of SampledBlock (one per sampler layer) into tensors for
+#     THEGCNModel.forward().
 
-    The innermost block (blocks[-1]) contains the direct neighbours of seeds
-    and is used for the TMP pass. The outer blocks (blocks[:-1]) are passed
-    to the SMP layers in order outermost → innermost.
+#     The innermost block (blocks[-1]) contains the direct neighbours of seeds
+#     and is used for the TMP pass. The outer blocks (blocks[:-1]) are passed
+#     to the SMP layers in order outermost → innermost.
 
-    Returns
-    -------
-    x          : [N_sub, feat_dim]   node features for subgraph
-    edge_index : [2, E]              local edge index (innermost block)
-    dts        : [E]                 Δt = query_ts[dst] - edge_ts  (for TimeEncode)
-    n_seeds    : int                 number of seed nodes
-    """
-    # Use innermost block for TMP
-    inner = blocks[-1]
-    global_ids = inner.nodes.to(device)        # [N_sub]  global node ids
-    x          = x_all[global_ids]             # [N_sub, feat]
-    edge_index = inner.edge_index.to(device)   # [2, E]
-    dts        = inner.dts.to(device)          # [E]  precomputed Δt
-    n_seeds    = inner.n_seeds
+#     Returns
+#     -------
+#     x          : [N_sub, feat_dim]   node features for subgraph
+#     edge_index : [2, E]              local edge index (innermost block)
+#     dts        : [E]                 Δt = query_ts[dst] - edge_ts  (for TimeEncode)
+#     n_seeds    : int                 number of seed nodes
+#     """
+#     # Use innermost block for TMP
+#     inner = blocks[-1]
+#     global_ids = inner.nodes.to(device)        # [N_sub]  global node ids
+#     x          = x_all[global_ids]             # [N_sub, feat]
+#     edge_index = inner.edge_index.to(device)   # [2, E]
+#     dts        = inner.dts.to(device)          # [E]  precomputed Δt
+#     n_seeds    = inner.n_seeds
 
-    return x, edge_index, dts, n_seeds, global_ids
+#     return x, edge_index, dts, n_seeds, global_ids
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -299,24 +321,23 @@ def eval_nodes(split_idx):
     idx_array = split_idx.cpu().numpy()
     for start in range(0, len(idx_array), BATCH_SIZE * 2):
         batch_idx = idx_array[start : start + BATCH_SIZE * 2]
-        seed_nodes = torch.from_numpy(batch_idx.astype(np.int32))
-        seed_ts    = node_time_all[batch_idx].cpu()
-        # seed_nodes = np.ascontiguousarray(batch_idx.astype(np.int32))
-        # seed_ts    = np.ascontiguousarray(node_time_all[batch_idx].cpu().numpy().astype(np.float32))
+        root_nodes = batch_idx.astype(np.int32)
+        ts         = node_time_all[batch_idx].cpu().numpy().astype(np.float32)
+        
+        sampler.sample(root_nodes, ts)
+        ret        = sampler.get_ret()
+        mfgs       = to_dgl_blocks(ret, hist=HISTORY, reverse=False, cuda=(device.type != 'cpu'))
+        batch_inputs = to_pyg_inputs(mfgs, device=device)
 
-        blocks = sampler.sample(seed_nodes, seed_ts)
-        if not blocks:
-            continue
-
-        x, edge_index, dts, n_seeds, global_ids = block_to_tensors(blocks)
-        labels = y_all[global_ids[:n_seeds]]
-
+        n_seeds = batch_inputs[-1][0]['size'][1]   # num_dst_nodes of innermost block
+        labels  = y_all[batch_inputs[-1][0]['node_ids'][:n_seeds]]
+ 
         logits = model(
-            x          = x,
-            edge_index = edge_index,
-            dts        = dts,
-            batch_size = n_seeds,
+            x_all        = x_all,
+            batch_inputs = batch_inputs,
+            batch_size   = n_seeds,
         )
+
         all_preds.append(logits.cpu().numpy())
         all_labels.append(labels.cpu().numpy())
 
@@ -332,6 +353,8 @@ def eval_nodes(split_idx):
     mcc = matthews_corrcoef(all_labels, pred_label)
     rc  = recall_score(all_labels, pred_label, zero_division=0)
     pr  = precision_score(all_labels, pred_label, zero_division=0)
+    # rc1 = recall_at_top_n_percent(all_labels, scores, 1)
+    # rc10 = recall_at_top_n_percent(all_labels, scores, 10)
 
     val_loss = torch.nn.BCEWithLogitsLoss()(
         torch.tensor(all_preds), torch.tensor(all_labels)
@@ -358,47 +381,56 @@ train_idx_np = train_idx.cpu().numpy()
 mlflow.set_experiment('thegcn-sampler')
 with mlflow.start_run():
     mlflow.log_params(vars(args))
-
+    
     for epoch in range(NUM_EPOCH):
+        logger.info(f"Epoch {epoch+1}:")
         model.train()
+
+        time_sample = 0
+        time_prep = 0
         m_loss = []
 
+        if sampler is not None:
+            sampler.reset()
+        
         # shuffle training indices each epoch
-        perm      = np.random.permutation(len(train_idx_np))
-        idx_perm  = train_idx_np[perm]
+        perm     = np.random.permutation(len(train_idx_np))
+        idx_perm = train_idx_np[perm]
 
         pbar = tqdm(range(0, len(idx_perm), BATCH_SIZE), desc=f'Epoch {epoch}')
         for start in pbar:
             batch_idx  = idx_perm[start : start + BATCH_SIZE]
-            seed_nodes = torch.from_numpy(batch_idx.astype(np.int32))
-            seed_ts    = node_time_all[batch_idx].cpu()
+            root_nodes = batch_idx.astype(np.int32)
+            ts         = node_time_all[batch_idx].cpu().numpy().astype(np.float32)
+            # sampling
+            sampler.sample(root_nodes, ts)
+            ret = sampler.get_ret()
+            time_sample += ret[0].sample_time()
             
-            try:
-                blocks = sampler.sample(seed_nodes, seed_ts)
-            except Exception as e:
-                logger.info(e)
-            if not blocks:
-                continue
+            # message flow graphs from sampled blocks
+            mfgs = to_dgl_blocks(ret, hist=HISTORY, reverse=False, cuda=(device != 'cpu'))
+            # to pyg inputs
+            batch_inputs = to_pyg_inputs(mfgs, device=device)
 
-            x, edge_index, dts, n_seeds, global_ids = block_to_tensors(blocks)
-            labels = y_all[global_ids[:n_seeds]]
+            n_seeds = batch_inputs[-1][0]['size'][1]
+            labels  = y_all[batch_inputs[-1][0]['node_ids'][:n_seeds]]
+
 
             logits = model(
-                x          = x,
-                edge_index = edge_index,
-                dts        = dts,
-                batch_size = n_seeds,
+                x_all        = x_all,
+                batch_inputs = batch_inputs,
+                batch_size   = n_seeds,
             )
             loss = criterion(logits, labels)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
             m_loss.append(loss.item())
             pbar.set_postfix({'loss': f'{np.mean(m_loss):.4f}'})
 
         val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, val_loss = eval_nodes(val_idx)
         scheduler.step(val_auc)
+
 
         logger.info(
             f'Epoch {epoch} | loss: {np.mean(m_loss):.4f} | val_loss: {val_loss:.4f} | '
