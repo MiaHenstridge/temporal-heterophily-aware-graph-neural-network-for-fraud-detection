@@ -326,8 +326,8 @@ class TGATModel(torch.nn.Module):
         # ── relative time per edge ────────────────────────────────────────────
         # time is [E] (1-D) as required by PyG's temporal NeighborLoader.
         # Unsqueeze to [E, 1] for the subtraction and TimeEncode.
-        # rel_t = node_time[src] - edge_time  →  [E, 1]
-        rel_t     = node_time[edge_index[0]] - time               # [E]
+        # rel_t = node_time[dst] - edge_time  →  [E, 1]
+        rel_t     = node_time[edge_index[1]] - time               # [E]
         rel_t_enc = self.time_enc(rel_t.float().unsqueeze(1)).squeeze(1)  # [E, time_dim]
 
         # ── input projection ──────────────────────────────────────────────────
