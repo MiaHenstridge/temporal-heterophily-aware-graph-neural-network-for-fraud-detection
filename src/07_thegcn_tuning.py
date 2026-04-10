@@ -153,12 +153,12 @@ device = torch.device(f'cuda:{GPU}' if torch.cuda.is_available() else 'cpu')
 # ─────────────────────────────────────────────────────────────────────────────
 if NUM_LAYER == 1:
     num_neighbors = [NUM_NEIGHBOR]
-# elif NUM_LAYER == 2:
-#     num_neighbors = [NUM_NEIGHBOR, 5]
+elif NUM_LAYER == 2:
+    num_neighbors = [NUM_NEIGHBOR, 5]
 else:
-    # step = max(1, (NUM_NEIGHBOR - 5) // (NUM_LAYER - 1))
-    # num_neighbors = [max(5, NUM_NEIGHBOR - i * step) for i in range(NUM_LAYER)]
-    num_neighbors = [NUM_NEIGHBOR] * NUM_LAYER
+    step = max(1, (NUM_NEIGHBOR - 5) // (NUM_LAYER - 1))
+    num_neighbors = [max(5, NUM_NEIGHBOR - i * step) for i in range(NUM_LAYER)]
+    # num_neighbors = [NUM_NEIGHBOR] * NUM_LAYER
     
 logger.info(f'NeighborLoader fanouts (outer→inner): {num_neighbors}')
 
@@ -298,7 +298,7 @@ train_loss_hist = []
 val_loss_hist   = []
 val_auc_hist    = []
 
-mlflow.set_experiment(f'thegcn-test')
+mlflow.set_experiment(f'thegcn-test-tanh')
 with mlflow.start_run():
     mlflow.log_params(vars(args))
 

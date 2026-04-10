@@ -391,7 +391,7 @@ class TMPConv(MessagePassing):
             ) -> torch.Tensor:          # [E, in_channels]
         # compute low pass weight p
         mlp_in = torch.cat([x_i, x_j, rel_t_enc], dim=-1)   # [E, 2*in_channels + time_dim]
-        p = torch.sigmoid(self.mlp(mlp_in))
+        p = torch.tanh(self.mlp(mlp_in))                    # or sigmoid
         # high pass weight q=1-p
         q = 1.0 - p
         return (p-q) * x_i  # signed message
@@ -432,7 +432,7 @@ class SMPConv(MessagePassing):
             h_j: torch.Tensor       # [E, hidden_channels]: destination node embeddings
     ) -> torch.Tensor:          # [E, hidden_channels]
         mlp_in = torch.cat([h_i, h_j], dim=-1)   # [E, 2*hidden_channels]
-        p = torch.sigmoid(self.mlp(mlp_in))
+        p = torch.tanh(self.mlp(mlp_in))         # or sigmoid
         q = 1.0 - p
         return (p-q) * h_i  # signed message
     
