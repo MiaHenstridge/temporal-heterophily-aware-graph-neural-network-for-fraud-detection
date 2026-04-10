@@ -18,7 +18,7 @@ from sklearn.metrics import (
 )
 
 from torch_geometric.loader import NeighborLoader
-from models import GraphSAGEModel, GATModel, GATv2Model
+from models import GraphSAGEModel, GATModel, GATv2Model, FAGCNModel
 
 import mlflow
 import matplotlib
@@ -39,8 +39,8 @@ parser.add_argument('-d', '--data',      type=str,   default='DGraphFin')
 parser.add_argument('--data_dir',        type=str,   default='./datasets',
                     help='root directory containing raw/dgraphfin.npz')
 parser.add_argument('--model',           type=str,   default='sage',
-                    choices=['sage', 'gat', 'gatv2'],
-                    help='sage = GraphSAGE, gat = GAT, gatv2 = GATv2')
+                    choices=['sage', 'gat', 'gatv2', 'fagcn'],
+                    help='sage = GraphSAGE, gat = GAT, gatv2 = GATv2, fagcn = FAGCN')
 parser.add_argument('--bs',              type=int,   default=1024,
                     help='number of seed nodes per mini-batch')
 parser.add_argument('--n_epoch',         type=int,   default=10)
@@ -51,6 +51,8 @@ parser.add_argument('--n_layer',         type=int,   default=2)
 parser.add_argument('--node_dim',        type=int,   default=128)
 parser.add_argument('--heads',           type=int,   default=4,
                     help='number of attention heads (GAT / GATv2 only)')
+parser.add_argument('--eps',             type=float, default=0.1,
+                    help='initial value of residual weight (FAGCN only)')
 parser.add_argument('--n_neighbor',      type=int,   default=10,
                     help='neighbors sampled per layer in NeighborLoader')
 parser.add_argument('--fold',            type=int,   default=0,
@@ -177,13 +179,21 @@ elif MODEL_TYPE == 'gat':
         heads           = args.heads,
         dropout         = DROP_OUT,
     ).to(device)
-else:  # gatv2
+elif MODEL_TYPE == 'gatv2':  # gatv2
     model = GATv2Model(
         in_channels     = node_feat_dim,
         hidden_channels = NODE_DIM,
         n_layers        = NUM_LAYER,
         heads           = args.heads,
         dropout         = DROP_OUT,
+    ).to(device)
+else:                   #fagcn
+    model = FAGCNModel(
+        in_channels=node_feat_dim,
+        hidden_channels=NODE_DIM,
+        n_layers=NUM_LAYER,
+        dropout=DROP_OUT,
+        eps=args.eps,
     ).to(device)
 
 logger.info(f'Model: {MODEL_TYPE.upper()} | params: {sum(p.numel() for p in model.parameters()):,}')

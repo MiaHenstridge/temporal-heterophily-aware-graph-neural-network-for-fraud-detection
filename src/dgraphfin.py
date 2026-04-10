@@ -303,9 +303,9 @@ def load_dgraphfin_temporal(data_dir, fold=0, to_undirected=True):
 
     # directed edge_index from adj_t  (row=dst, col=src)
     row_t, col_t, _ = data.adj_t.coo()
-    src = col_t
-    dst = row_t
-    edge_index_directed = torch.stack([src, dst], dim=0)
+    src = col_t                             # original src: applicant i
+    dst = row_t                             # original dst: emergency contact j
+    edge_index_directed = torch.stack([dst, src], dim=0)        # Flip: messages should flow from j → i so applicant i aggregates from contacts j
 
     # edge timestamps from DGraphFinv2 dataset
     et = torch.tensor(
