@@ -343,6 +343,113 @@ class TGATModel(torch.nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TGAT with TGL Parallel Sampler
+# ─────────────────────────────────────────────────────────────────────────────
+class TGATSamplerModel(torch.nn.Module):
+    """
+    TGAT variant that accepts pre-sampled batch_inputs from the TGL C++
+    ParallelSampler via to_dgl_blocks + to_pyg_inputs.
+ 
+    Compared to TGAT:
+    - dts (Δt per edge) is provided directly from the sampler — no need to
+      recompute rel_t inside the model.
+    - node features are looked up from the global x_all matrix using node_ids
+      returned by the sampler, so x is not passed directly.
+    - Works with HISTORY=1 (TGAT-style, one temporal snapshot per layer).
+ 
+    Parameters
+    ----------
+    in_channels : int
+    hidden_channels : int
+    n_smp_layers : int
+        Number of SMP layers (L in paper). 0 = TMP only.
+    time_dim : int
+    dropout : float
+    """
+ 
+    def __init__(
+        self,
+        in_channels:     int,
+        hidden_channels: int,
+        n_layers:        int,
+        n_head:          int,
+        time_dim:        int,
+        dropout:         float = 0.2,
+    ):
+        super().__init__()
+        assert hidden_channels % n_head == 0, \
+            f'hidden_channels ({hidden_channels}) must be divisible by n_head ({n_head})'
+
+        self.time_enc   = TimeEncode(time_dim)
+        self.input_proj = torch.nn.Linear(in_channels, hidden_channels)
+        self.dropout    = dropout
+        self.n_layers   = n_layers
+
+        self.convs = torch.nn.ModuleList()
+        self.norms = torch.nn.ModuleList()
+
+        for _ in range(n_layers):
+            self.convs.append(
+                TransformerConv(
+                    in_channels  = hidden_channels,
+                    out_channels = hidden_channels // n_head,
+                    heads        = n_head,
+                    edge_dim     = time_dim,
+                    dropout      = dropout,
+                    concat       = True,
+                    beta         = False,
+                )
+            )
+            self.norms.append(torch.nn.BatchNorm1d(hidden_channels))
+
+        self.clf = torch.nn.Sequential(
+            torch.nn.Linear(hidden_channels, hidden_channels),
+            torch.nn.BatchNorm1d(hidden_channels),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_channels, hidden_channels // 2),
+            torch.nn.BatchNorm1d(hidden_channels // 2),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_channels // 2, 1),
+        )
+ 
+    def forward(
+        self,
+        x_all:       torch.Tensor,   # [N_total, in_channels]  full node feature matrix on device
+        batch_inputs: list,           # output of to_pyg_inputs(mfgs)
+        batch_size:  int,             # number of seed nodes
+    ) -> torch.Tensor:               # [batch_size] logits
+ 
+        # batch_inputs[layer][hist=0] = dict with node_ids, edge_index, edge_dts
+        # innermost layer = batch_inputs[-1][0]
+        inner = batch_inputs[-1][0]
+ 
+        node_ids   = inner['node_ids']    # [N_sub]  global node ids
+        edge_index = inner['edge_index']  # [2, E]   local index space
+        dts        = inner['edge_dts']    # [E]      Δt = query_ts[dst] - edge_ts
+ 
+        # Look up node features from global matrix
+        x = x_all[node_ids]              # [N_sub, in_channels]
+ 
+        # ── time encoding ─────────────────────────────────────────────────────
+        # dts is already Δt per edge from the TGL sampler — feed directly to
+        # TimeEncode. Unsqueeze to [E, 1] for TimeEncode's [N, L] input format.
+        rel_t_enc = self.time_enc(dts.float().unsqueeze(1)).squeeze(1)  # [E, time_dim]
+ 
+        # ── input projection ──────────────────────────────────────────────────
+        h = F.relu(self.input_proj(x))                            # [N, hidden]
+
+        # ── conv layers ───────────────────────────────────────────────────────
+        for conv, norm in zip(self.convs, self.norms):
+            h = norm(conv(h, edge_index, edge_attr=rel_t_enc).relu())
+            h = F.dropout(h, p=self.dropout, training=self.training)
+
+        # ── classify seed nodes only ──────────────────────────────────────────
+        return self.clf(h[:batch_size]).squeeze(-1)               # [batch_size]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # THEGCN model
 # ─────────────────────────────────────────────────────────────────────────────
 class TMPConv(MessagePassing):

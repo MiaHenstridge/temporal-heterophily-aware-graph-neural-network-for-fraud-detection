@@ -1,7 +1,7 @@
 """
-07_thegcn_tuning.py
+06_tgat_tuning.py
 ===================
-THEGCN training script using the TGL C++ parallel sampler for temporally-
+TGAT training script using the TGL C++ parallel sampler for temporally-
 correct neighbourhood sampling.
 
 Prerequisites
@@ -13,9 +13,8 @@ Prerequisites
        python src/tgl_data_preprocess.py
 
 3. Run training:
-       python src/07_thegcn_tuning_with_sampler.py --prefix run1 --n_epoch 50 --bs 1024 \\
+       python src/06_tgat_tuning_with_sampler.py --prefix run1 --n_epoch 50 --bs 1024 \\
            --n_layer 2 --node_dim 128 --time_dim 100 --n_neighbor 10 --gpu 0
-
 """
 
 import os
@@ -48,7 +47,7 @@ faulthandler.enable()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import THEGCNModel, THEGCNSamplerModel
+from models import TGATModel, TGATSamplerModel
 from utils import *
 from namespaces import DA
 from dgraphfin import load_dgraphfin_temporal
@@ -63,7 +62,7 @@ os.makedirs('./saved_checkpoints', exist_ok=True)
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
-parser = argparse.ArgumentParser('THEGCN Node Classification on DGraphFin (TGL sampler)')
+parser = argparse.ArgumentParser('TGAT Node Classification on DGraphFin (TGL sampler)')
 parser.add_argument('-d', '--data',       type=str,   default='DGraphFin')
 parser.add_argument('--data_dir',         type=str,   default='./datasets')
 parser.add_argument('--sampler_dir',     type=str,   default='./processed_data/tgl',
@@ -74,11 +73,12 @@ parser.add_argument('--lr',               type=float, default=1e-3)
 parser.add_argument('--drop_out',         type=float, default=0.2)
 parser.add_argument('--gpu',              type=int,   default=0)
 parser.add_argument('--n_layer',          type=int,   default=2,
-                    help='Number of SMP layers (L in paper). 0 = TMP only.')
+                    help='Number of GATConv latyers.')
 parser.add_argument('--node_dim',         type=int,   default=128,
-                    help='Hidden dimension for SMP layers and classifier.')
+                    help='Hidden dimension for GATConv layers.')
 parser.add_argument('--time_dim',         type=int,   default=100,
                     help='Dimension of sinusoidal time encoding.')
+parser.add_argument('--n_head',           type=int,   default=4,)
 
 parser.add_argument('--num_threads',      type=int,   default=8,
                     help='Total OMP threads for C++ sampler.')
@@ -123,6 +123,7 @@ DATA          = args.data
 NODE_DIM      = args.node_dim
 TIME_DIM      = args.time_dim
 NUM_LAYER     = args.n_layer
+NUM_HEAD      = args.n_head
 NUM_NEIGHBOR  = args.n_neighbor
 STRATEGY      = args.strategy
 PROP_TIME     = args.prop_time
@@ -137,8 +138,8 @@ TOLERANCE     = args.tolerance
 WEIGHT_DECAY  = args.weight_decay
 EARLY_STOP_HIGHER_BETTER = args.early_stop_higher_better
 
-MODEL_SAVE_PATH     = f'./saved_models/{args.prefix}-thegcn-with-sampler-node-{DATA}.pth'
-get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{args.prefix}-thegcn-with-sampler-node-{DATA}-{epoch}.pt'
+MODEL_SAVE_PATH     = f'./saved_models/{args.prefix}-tgat-with-sampler-node-{DATA}.pth'
+get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{args.prefix}-tgat-with-sampler-node-{DATA}-{epoch}.pt'
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logger
@@ -238,16 +239,17 @@ y_all         = y_all.to(device)
 # Model
 # ─────────────────────────────────────────────────────────────────────────────
 
-model = THEGCNSamplerModel(
+model = TGATSamplerModel(
     in_channels     = node_feat_dim,
     hidden_channels = NODE_DIM,
-    n_smp_layers    = NUM_LAYER,
+    n_layers        = NUM_LAYER,
+    n_head          = NUM_HEAD,
     time_dim        = TIME_DIM,
     dropout         = DROP_OUT,
 ).to(device)
 
 logger.info(
-    f'THEGCN | smp_layers: {NUM_LAYER} | hidden: {NODE_DIM} | '
+    f'TGAT | num_layers: {NUM_LAYER} | hidden: {NODE_DIM} | '
     f'time_dim: {TIME_DIM} | '
     f'params: {sum(p.numel() for p in model.parameters()):,}'
 )
@@ -269,7 +271,6 @@ optimizer  = torch.optim.Adam(
 scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-5
 )
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -476,7 +477,7 @@ with mlflow.start_run():
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
 
-    plt.title('TGAT (TGL sampler) — Training Curve')
+    plt.title('THEGCN (TGL sampler) — Training Curve')
     plt.tight_layout()
 
     plot_path = f'./saved_models/{args.prefix}-tgat-sampler-node-{DATA}-training-curve.png'
