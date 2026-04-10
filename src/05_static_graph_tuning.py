@@ -43,7 +43,7 @@ parser.add_argument('--model',           type=str,   default='sage',
                     help='sage = GraphSAGE, gat = GAT, gatv2 = GATv2, fagcn = FAGCN')
 parser.add_argument('--bs',              type=int,   default=1024,
                     help='number of seed nodes per mini-batch')
-parser.add_argument('--n_epoch',         type=int,   default=10)
+parser.add_argument('--n_epoch',         type=int,   default=100)
 parser.add_argument('--lr',              type=float, default=1e-3)
 parser.add_argument('--drop_out',        type=float, default=0.2)
 parser.add_argument('--gpu',             type=int,   default=0)
