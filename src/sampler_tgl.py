@@ -63,7 +63,7 @@ if __name__ == '__main__':
                               g['eid'], 
                               g['ts'].astype(np.float32),
                               args.num_thread, 
-                              8,                               # num_workers
+                              1,                               # num_workers
                               args.n_layer, 
                               num_neighbors,
                               args.strategy=='recent', 
@@ -80,8 +80,8 @@ if __name__ == '__main__':
     sea_time = 0
     sam_time = 0
     uni_time = 0
-    # total_nodes = 0
-    # unique_nodes = 0
+    total_nodes = 0
+    unique_nodes = 0
     for _, rows in tqdm(df.groupby(df.index // args.batch_size), total=len(df) // args.batch_size):
         root_nodes = np.concatenate([rows.src.values, rows.dst.values, neg_link_sampler.sample(len(rows))]).astype(np.int32)
         ts = np.concatenate([rows.time.values, rows.time.values, rows.time.values]).astype(np.float32)
@@ -92,18 +92,18 @@ if __name__ == '__main__':
         coo_time += ret[0].coo_time()
         sea_time += ret[0].search_time()
         sam_time += ret[0].sample_time()
-        # for i in range(args.history):
-        #     total_nodes += ret[i].dim_in() - ret[i].dim_out()
-        #     unique_nodes += ret[i].dim_in() - ret[i].dim_out()
-        #     if ret[i].dim_in() > ret[i].dim_out():
-        #         ts = torch.from_numpy(ret[i].ts()[ret[i].dim_out():])
-        #         nid = torch.from_numpy(ret[i].nodes()[ret[i].dim_out():]).float()
-        #         nts = torch.stack([ts,nid],dim=1).cuda()
-        #         uni_t_s = time.time()
-        #         unts, idx = torch.unique(nts, dim=0, return_inverse=True)
-        #         uni_time += time.time() - uni_t_s
-        #         total_nodes += idx.shape[0]
-        #         unique_nodes += unts.shape[0]
+        for i in range(args.history):
+            total_nodes += ret[i].dim_in() - ret[i].dim_out()
+            unique_nodes += ret[i].dim_in() - ret[i].dim_out()
+            if ret[i].dim_in() > ret[i].dim_out():
+                ts = torch.from_numpy(ret[i].ts()[ret[i].dim_out():])
+                nid = torch.from_numpy(ret[i].nodes()[ret[i].dim_out():]).float()
+                nts = torch.stack([ts,nid],dim=1).cuda()
+                uni_t_s = time.time()
+                unts, idx = torch.unique(nts, dim=0, return_inverse=True)
+                uni_time += time.time() - uni_t_s
+                total_nodes += idx.shape[0]
+                unique_nodes += unts.shape[0]
 
     print('total time  : {:.4f}'.format(tot_time))
     print('pointer time: {:.4f}'.format(ptr_time))
@@ -111,9 +111,9 @@ if __name__ == '__main__':
     print('search time : {:.4f}'.format(sea_time))
     print('sample time : {:.4f}'.format(sam_time))
     print('unique time : {:.4f}'.format(uni_time))
-    # print('unique per  : {:.4f}'.format(unique_nodes / total_nodes))
-    # print('total nodes : {}'.format(total_nodes))
-    # print('unique nodes : {}'.format(unique_nodes))
+    print('unique per  : {:.4f}'.format(unique_nodes / total_nodes))
+    print('total nodes : {}'.format(total_nodes))
+    print('unique nodes : {}'.format(unique_nodes))
 
 
 
