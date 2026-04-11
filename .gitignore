@@ -39,5 +39,5 @@ build/*
 src/backup/prepare_edges.ipynb
 src/sampler_tgl.py
 
-backup
-backup/*
+src/backup
+src/backup/*
