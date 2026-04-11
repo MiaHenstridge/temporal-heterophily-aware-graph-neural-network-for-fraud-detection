@@ -100,8 +100,18 @@ parser.add_argument('--fold',             type=int,   default=0)
 parser.add_argument('--prefix',           type=str,   default='')
 parser.add_argument('--max_round',        type=int,   default=10)
 parser.add_argument('--tolerance',        type=float, default=1e-4)
-parser.add_argument('--pos_weight',       type=float, default=100,
-                    help='Positive class weight. -1 = auto (n_neg/n_pos).')
+
+parser.add_argument('--loss',            type=str, default='bce',
+                    help='loss function to use for training (bce or focal)')
+parser.add_argument('--pos_weight',      type=float, default=100,
+                    help='positive class weight; -1 = auto (n_neg/n_pos)')
+parser.add_argument('--alpha',           type=float, default=0.95,
+                    help="weight for the positive (fraud) class (only use when loss='focal'). Must be between (0, 1)")
+parser.add_argument('--gamma',           type=float, default=2.0,
+                    help="focusing exponent (only use when loss='focal'). Must be >= 0")
+parser.add_argument('--reduction',       type=str, default='mean',
+                    help="'mean' (default), 'sum', or 'none' (only use when loss='focal')")
+
 parser.add_argument('--weight_decay',     type=float, default=5e-7)
 parser.add_argument('--to_undirected',    action='store_true', default=False)
 parser.add_argument('--early_stop_higher_better', action='store_true', default=False)
@@ -135,6 +145,7 @@ NUM_WORKERS   = args.num_workers
 
 MAX_ROUND     = args.max_round
 TOLERANCE     = args.tolerance
+LOSS          = args.loss
 WEIGHT_DECAY  = args.weight_decay
 EARLY_STOP_HIGHER_BETTER = args.early_stop_higher_better
 
@@ -258,13 +269,18 @@ logger.info(
 # Loss / optimiser
 # ─────────────────────────────────────────────────────────────────────────────
 
-n_neg = (train_labels_np == 0).sum()
-n_pos = (train_labels_np == 1).sum()
-pw    = float(n_neg) / float(n_pos) if args.pos_weight < 0 else args.pos_weight
-logger.info(f'pos_weight: {pw:.2f}')
+if LOSS == 'bce':
+    n_neg = (train_labels_np == 0).sum()
+    n_pos = (train_labels_np == 1).sum()
+    pw    = float(n_neg) / float(n_pos) if args.pos_weight < 0 else args.pos_weight
+    logger.info(f'Using BCEWithLogitsLoss with pos_weight: {pw:.2f}')
+    pos_weight = torch.tensor([pw], dtype=torch.float, device=device)
+    criterion  = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+elif LOSS == 'focal':
+    logger.info(f"Using BalancedFocalLoss with alpha: {args.alpha:.2f}, gamma: {args.gamma:.2f}, reduction: {args.reduction}")
+    criterion = BalancedFocalLoss(alpha=args.alpha, gamma=args.gamma, reduction=args.reduction)
 
-pos_weight = torch.tensor([pw], dtype=torch.float, device=device)
-criterion  = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
 optimizer  = torch.optim.Adam(
     model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
 )
@@ -278,7 +294,7 @@ scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def eval_nodes(split_idx):
+def eval_nodes(split_idx, criterion):
     model.eval()
     all_preds, all_labels = [], []
 
@@ -321,7 +337,7 @@ def eval_nodes(split_idx):
     # rc1 = recall_at_top_n_percent(all_labels, scores, 1)
     # rc10 = recall_at_top_n_percent(all_labels, scores, 10)
 
-    val_loss = torch.nn.BCEWithLogitsLoss()(
+    val_loss = criterion(
         torch.tensor(all_preds), torch.tensor(all_labels)
     ).item()
 
@@ -393,7 +409,7 @@ with mlflow.start_run():
             m_loss.append(loss.item())
             pbar.set_postfix({'loss': f'{np.mean(m_loss):.4f}'})
 
-        val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, val_loss = eval_nodes(val_idx)
+        val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, val_loss = eval_nodes(val_idx, criterion)
         scheduler.step(val_auc)
 
 
@@ -431,7 +447,7 @@ with mlflow.start_run():
                 last_saved_epoch = epoch
 
     # ── final test ───────────────────────────────────────────────────────────
-    test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, _ = eval_nodes(test_idx)
+    test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, _ = eval_nodes(test_idx, criterion)
     logger.info(
         f'Test | auc: {test_auc:.4f} | ap: {test_ap:.4f} | '
         f'f1: {test_f1:.4f} | mcc: {test_mcc:.4f} | '

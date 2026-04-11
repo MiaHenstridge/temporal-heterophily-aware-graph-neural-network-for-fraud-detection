@@ -35,6 +35,95 @@ class EarlyStopMonitor(object):
 
         self.epoch_count += 1
         return self.num_round >= self.max_round
+    
+
+# Balanced Focal Loss function
+class BalancedFocalLoss(torch.nn.Module):
+    """
+    Balanced Focal Loss for binary classification with severe class imbalance.
+ 
+    Formula (Lin et al., 2017):
+        FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+ 
+    where:
+        p_t = sigmoid(logit)      for positive labels (y=1)
+        p_t = 1 - sigmoid(logit)  for negative labels (y=0)
+        alpha_t = alpha     for positives
+        alpha_t = 1 - alpha for negatives
+ 
+    Compared to BCEWithLogitsLoss(pos_weight=w):
+      - pos_weight linearly scales the positive loss.
+      - Focal loss additionally suppresses easy negatives via (1-p_t)^gamma,
+        which is more effective when the model already assigns low scores to
+        most negatives (as happens after a few epochs on DGraphFin).
+ 
+    Parameters
+    ----------
+    alpha : float
+        Weight for the positive (fraud) class. Should be > 0.5 when positives
+        are rare. Typical values: 0.75 – 0.95 for 1% fraud rate.
+        alpha=0.5 reduces to unweighted focal loss.
+    gamma : float
+        Focusing exponent. gamma=0 reduces to standard cross-entropy.
+        gamma=2 is the value used in the original paper (RetinaNet).
+        Higher gamma → stronger suppression of easy examples.
+        Typical values for fraud detection: 1.0 – 3.0.
+    reduction : str
+        'mean' (default), 'sum', or 'none'.
+    """
+ 
+    def __init__(
+        self,
+        alpha:     float = 0.75,
+        gamma:     float = 2.0,
+        reduction: str   = 'mean',
+    ):
+        super().__init__()
+        assert 0 < alpha < 1, "alpha must be in (0, 1)"
+        assert gamma >= 0,    "gamma must be >= 0"
+        assert reduction in ('mean', 'sum', 'none')
+ 
+        self.alpha     = alpha
+        self.gamma     = gamma
+        self.reduction = reduction
+ 
+    def forward(
+        self,
+        logits: torch.Tensor,   # [N]  raw model output (before sigmoid)
+        labels: torch.Tensor,   # [N]  binary float labels (0.0 or 1.0)
+    ) -> torch.Tensor:
+ 
+        # Numerically stable BCE per element: log(sigmoid(x)) and log(1-sigmoid(x))
+        # Using F.binary_cross_entropy_with_logits with reduction='none'
+        bce = F.binary_cross_entropy_with_logits(
+            logits, labels, reduction='none'
+        )                                                   # [N]
+ 
+        # p_t: probability of the true class
+        #   for y=1: p_t = sigmoid(logit)
+        #   for y=0: p_t = 1 - sigmoid(logit) = sigmoid(-logit)
+        probs = torch.sigmoid(logits)                       # [N]
+        p_t   = labels * probs + (1.0 - labels) * (1.0 - probs)  # [N]
+ 
+        # Focal weight: (1 - p_t)^gamma
+        # Easy examples (p_t → 1) get weight → 0; hard examples keep full weight
+        focal_weight = (1.0 - p_t) ** self.gamma           # [N]
+ 
+        # Alpha balancing: alpha for positives, (1-alpha) for negatives
+        alpha_t = labels * self.alpha + (1.0 - labels) * (1.0 - self.alpha)  # [N]
+ 
+        # Combined loss
+        loss = alpha_t * focal_weight * bce                # [N]
+ 
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+ 
+    def extra_repr(self) -> str:
+        return f'alpha={self.alpha}, gamma={self.gamma}, reduction={self.reduction}'
 
     
 # function for recall@topk%
