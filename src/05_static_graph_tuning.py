@@ -24,7 +24,7 @@ import mlflow
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from utils import EarlyStopMonitor
+from utils import EarlyStopMonitor, augment_static_features, BalancedFocalLoss
 from namespaces import DA
 from dgraphfin import load_dgraphfin
 
@@ -49,7 +49,9 @@ parser.add_argument('--drop_out',        type=float, default=0.2)
 parser.add_argument('--gpu',             type=int,   default=0)
 parser.add_argument('--n_layer',         type=int,   default=2)
 parser.add_argument('--node_dim',        type=int,   default=128)
-parser.add_argument('--heads',           type=int,   default=4,
+parser.add_argument('--feat_augment',     action='store_true', default=False,
+                    help='whether to augment features')
+parser.add_argument('--n_head',           type=int,   default=4,
                     help='number of attention heads (GAT / GATv2 only)')
 parser.add_argument('--eps',             type=float, default=0.1,
                     help='initial value of residual weight (FAGCN only)')
@@ -60,8 +62,18 @@ parser.add_argument('--fold',            type=int,   default=0,
 parser.add_argument('--prefix',          type=str,   default='')
 parser.add_argument('--max_round',       type=int,   default=10)
 parser.add_argument('--tolerance',       type=float, default=1e-4)
+
+parser.add_argument('--loss',            type=str, default='bce',
+                    help='loss function to use for training (bce or focal)')
 parser.add_argument('--pos_weight',      type=float, default=100,
-                    help='positive class weight for BCE loss. -1 = auto (n_neg/n_pos)')
+                    help='positive class weight; -1 = auto (n_neg/n_pos)')
+parser.add_argument('--alpha',           type=float, default=0.95,
+                    help="weight for the positive (fraud) class (only use when loss='focal'). Must be between (0, 1)")
+parser.add_argument('--gamma',           type=float, default=2.0,
+                    help="focusing exponent (only use when loss='focal'). Must be >= 0")
+parser.add_argument('--reduction',       type=str, default='mean',
+                    help="'mean' (default), 'sum', or 'none' (only use when loss='focal')")
+
 parser.add_argument('--num_workers',     type=int,   default=12)
 parser.add_argument('--weight_decay',    type=float, default=5e-7)
 parser.add_argument('--early_stop_higher_better', action='store_true', default=False)
@@ -79,17 +91,19 @@ DROP_OUT      = args.drop_out
 GPU           = args.gpu
 DATA          = args.data
 NODE_DIM      = args.node_dim
+FEAT_AUGMENT  = args.feat_augment
 NUM_LAYER     = args.n_layer
 NUM_NEIGHBOR  = args.n_neighbor
 MAX_ROUND     = args.max_round
 TOLERANCE     = args.tolerance
 MODEL_TYPE    = args.model
+LOSS          = args.loss
 NUM_WORKERS   = args.num_workers
 WEIGHT_DECAY  = args.weight_decay
 EARLY_STOP_HIGHER_BETTER = args.early_stop_higher_better
 
-MODEL_SAVE_PATH     = f'./saved_models/{MODEL_TYPE}-{args.prefix}-node-{DATA}.pth'
-get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{MODEL_TYPE}-{args.prefix}-node-{DATA}-{epoch}'
+MODEL_SAVE_PATH     = f'./saved_models/{args.prefix}-{MODEL_TYPE}-node-{DATA}.pth'
+get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{args.prefix}-{MODEL_TYPE}-node-{DATA}-{epoch}'
 
 ################## logger ##################
 logging.basicConfig(level=logging.INFO)
@@ -107,7 +121,7 @@ logger.addHandler(ch)
 logger.info(args)
 
 ################## load & process data ##################
-bundle = load_dgraphfin(data_dir=args.data_dir, fold=args.fold)
+bundle = load_dgraphfin(data_dir=args.data_dir, fold=args.fold, to_undirected=False)
 
 graph         = bundle.graph
 train_idx     = bundle.train_idx
@@ -115,6 +129,10 @@ val_idx       = bundle.val_idx
 test_idx      = bundle.test_idx
 train_labels_np = bundle.train_labels
 node_feat_dim = bundle.node_feat_dim
+
+if FEAT_AUGMENT:
+    graph.x       = augment_static_features(graph.x, graph.edge_index, train_idx)
+    node_feat_dim = graph.x.shape[1]
 
 logger.info(f'Train nodes: {len(train_idx)} | Val nodes: {len(val_idx)} | Test nodes: {len(test_idx)}')
 logger.info(f'Train fraud rate: {train_labels_np.mean():.4f}')
@@ -176,7 +194,7 @@ elif MODEL_TYPE == 'gat':
         in_channels     = node_feat_dim,
         hidden_channels = NODE_DIM,
         n_layers        = NUM_LAYER,
-        heads           = args.heads,
+        heads           = args.n_head,
         dropout         = DROP_OUT,
     ).to(device)
 elif MODEL_TYPE == 'gatv2':  # gatv2
@@ -184,7 +202,7 @@ elif MODEL_TYPE == 'gatv2':  # gatv2
         in_channels     = node_feat_dim,
         hidden_channels = NODE_DIM,
         n_layers        = NUM_LAYER,
-        heads           = args.heads,
+        heads           = args.n_head,
         dropout         = DROP_OUT,
     ).to(device)
 else:                   #fagcn
@@ -199,13 +217,18 @@ else:                   #fagcn
 logger.info(f'Model: {MODEL_TYPE.upper()} | params: {sum(p.numel() for p in model.parameters()):,}')
 
 ################## loss / optimiser ##################
-n_neg = (train_labels_np == 0).sum()
-n_pos = (train_labels_np == 1).sum()
-pw    = float(n_neg) / float(n_pos) if args.pos_weight < 0 else args.pos_weight
-logger.info(f'pos_weight: {pw:.2f}')
+if LOSS == 'bce':
+    n_neg = (train_labels_np == 0).sum()
+    n_pos = (train_labels_np == 1).sum()
+    pw    = float(n_neg) / float(n_pos) if args.pos_weight < 0 else args.pos_weight
+    logger.info(f'Using BCEWithLogitsLoss with pos_weight: {pw:.2f}')
+    pos_weight = torch.tensor([pw], dtype=torch.float, device=device)
+    criterion  = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+elif LOSS == 'focal':
+    logger.info(f"Using BalancedFocalLoss with alpha: {args.alpha:.2f}, gamma: {args.gamma:.2f}, reduction: {args.reduction}")
+    criterion = BalancedFocalLoss(alpha=args.alpha, gamma=args.gamma, reduction=args.reduction).to(device)
 
-pos_weight = torch.tensor([pw], dtype=torch.float, device=device)
-criterion  = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
 optimizer  = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-5
@@ -213,7 +236,7 @@ scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
 
 ################## eval ##################
 @torch.no_grad()
-def eval_nodes(loader):
+def eval_nodes(loader, criterion):
     model.eval()
     all_preds, all_labels = [], []
 
@@ -240,8 +263,9 @@ def eval_nodes(loader):
     rc  = recall_score(all_labels, pred_label, zero_division=0)
     pr  = precision_score(all_labels, pred_label, zero_division=0)
 
-    val_loss = torch.nn.BCEWithLogitsLoss()(
-        torch.tensor(all_preds), torch.tensor(all_labels)
+    val_loss = criterion(
+        torch.tensor(all_preds, device=device),
+        torch.tensor(all_labels, device=device),
     ).item()
 
     return auc, ap, f1, mcc, rc, pr, val_loss
@@ -278,7 +302,7 @@ with mlflow.start_run():
             m_loss.append(loss.item())
             pbar.set_postfix({'loss': f'{np.mean(m_loss):.4f}'})
 
-        val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, val_loss = eval_nodes(val_loader)
+        val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, val_loss = eval_nodes(val_loader, criterion)
         scheduler.step(val_auc)
 
         logger.info(
@@ -315,7 +339,7 @@ with mlflow.start_run():
                 last_saved_epoch = epoch
 
     # ── final test ──────────────────────────────────────────────────────────
-    test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, test_loss = eval_nodes(test_loader)
+    test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, test_loss = eval_nodes(test_loader, criterion)
     logger.info(
         f'Test | auc: {test_auc:.4f} | ap: {test_ap:.4f} | '
         f'f1: {test_f1:.4f} | mcc: {test_mcc:.4f} | '

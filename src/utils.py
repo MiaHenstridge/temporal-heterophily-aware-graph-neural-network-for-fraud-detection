@@ -156,13 +156,60 @@ def recall_at_top_n_percent(y_true, y_scores, n_percent):
     return tp_k / total_positives
 
 
-# load tgl graph (edges.csv and ext_full.npz)
+# ─────────────────────────────────────────────────────────────────────────────
+# Static graph feature augmentation
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def augment_static_features(x, edge_index, train_idx):
+    """
+    Compute degree-based structural features from the full directed graph
+    and concatenate with base node features.
+ 
+    Parameters
+    ----------
+    x          : FloatTensor [N, F]    base node features (on any device)
+    edge_index : LongTensor  [2, E]    DIRECTED edge index (src -> dst)
+                                        use the raw directed edges before
+                                        symmetrisation for meaningful
+                                        out_deg / in_deg separation
+    train_idx  : LongTensor  [N_train] training node indices
+ 
+    Returns
+    -------
+    FloatTensor [N, F+3]   base features concatenated with normalised
+                            [out_deg, in_deg, deg_ratio]
+    """
+    N      = x.shape[0]
+    device = x.device
+    src, dst = edge_index[1].to(device), edge_index[0].to(device)  # flip to j -> i: contact -> applicant
+ 
+    ones      = torch.ones(src.shape[0], device=device)
+    out_deg   = torch.zeros(N, device=device).scatter_add_(0, src, ones)
+    in_deg    = torch.zeros(N, device=device).scatter_add_(0, dst, ones)
+    deg_ratio = out_deg / (in_deg + 1.0)
+ 
+    extra = torch.stack([out_deg, in_deg, deg_ratio], dim=1).float()  # [N, 3]
+ 
+    # fit normalisation on training nodes only
+    mean  = extra[train_idx].mean(0)
+    std   = extra[train_idx].std(0).clamp(min=1e-8)
+    extra = (extra - mean) / std
+ 
+    return torch.cat([x, extra], dim=1)   # [N, F+3]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Load temporal graph for Temporal Parallel Sampler
+# ─────────────────────────────────────────────────────────────────────────────
 def load_graph(data_dir):
     df = pd.read_csv(f'{data_dir}/edges.csv')
     g = np.load(f'{data_dir}/ext_full.npz')
     return g, df
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Post-processing after Temporal Parallel Sampler
+# ─────────────────────────────────────────────────────────────────────────────
 def to_dgl_blocks(ret, hist, reverse=False, cuda=True):
     mfgs = list()
     for r in ret:
