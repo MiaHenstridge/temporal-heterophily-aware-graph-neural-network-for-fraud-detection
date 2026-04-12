@@ -78,6 +78,8 @@ parser.add_argument('--node_dim',         type=int,   default=128,
                     help='Hidden dimension for GATConv layers.')
 parser.add_argument('--time_dim',         type=int,   default=100,
                     help='Dimension of sinusoidal time encoding.')
+parser.add_argument('--feat_augment',     action='store_true', default=False,
+                    help='whether to augment features')
 parser.add_argument('--n_head',           type=int,   default=4,)
 
 parser.add_argument('--num_threads',      type=int,   default=8,
@@ -132,6 +134,7 @@ DATA          = args.data
 
 NODE_DIM      = args.node_dim
 TIME_DIM      = args.time_dim
+FEAT_AUGMENT  = args.feat_augment
 NUM_LAYER     = args.n_layer
 NUM_HEAD      = args.n_head
 NUM_NEIGHBOR  = args.n_neighbor
@@ -257,6 +260,7 @@ model = TGATSamplerModel(
     n_head          = NUM_HEAD,
     time_dim        = TIME_DIM,
     dropout         = DROP_OUT,
+    feature_augment = FEAT_AUGMENT,
 ).to(device)
 
 logger.info(
@@ -278,7 +282,7 @@ if LOSS == 'bce':
     criterion  = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 elif LOSS == 'focal':
     logger.info(f"Using BalancedFocalLoss with alpha: {args.alpha:.2f}, gamma: {args.gamma:.2f}, reduction: {args.reduction}")
-    criterion = BalancedFocalLoss(alpha=args.alpha, gamma=args.gamma, reduction=args.reduction)
+    criterion = BalancedFocalLoss(alpha=args.alpha, gamma=args.gamma, reduction=args.reduction).to(device)
 
 
 optimizer  = torch.optim.Adam(
@@ -338,7 +342,8 @@ def eval_nodes(split_idx, criterion):
     # rc10 = recall_at_top_n_percent(all_labels, scores, 10)
 
     val_loss = criterion(
-        torch.tensor(all_preds), torch.tensor(all_labels)
+        torch.tensor(all_preds, device=device),
+        torch.tensor(all_labels, device=device),
     ).item()
 
     return auc, ap, f1, mcc, rc, pr, val_loss

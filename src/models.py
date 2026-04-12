@@ -245,104 +245,6 @@ class TimeEncode(torch.nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TGAT model
-# ─────────────────────────────────────────────────────────────────────────────
-class TGATModel(torch.nn.Module):
-    """
-    Temporal Graph Attention Network for node classification.
-
-    Parameters
-    ----------
-    in_channels : int
-        Raw node feature dimension (17 for DGraphFin).
-    hidden_channels : int
-        Hidden dimension (must be divisible by n_head).
-    n_layers : int
-        Number of TGAT layers to stack.
-    n_head : int
-        Number of attention heads in TransformerConv.
-    time_dim : int
-        Dimension of the sinusoidal time encoding.
-    dropout : float
-        Dropout probability applied after each conv layer and in the MLP.
-    """
-
-    def __init__(
-        self,
-        in_channels:     int,
-        hidden_channels: int,
-        n_layers:        int,
-        n_head:          int,
-        time_dim:        int,
-        dropout:         float = 0.2,
-    ):
-        super().__init__()
-        assert hidden_channels % n_head == 0, \
-            f'hidden_channels ({hidden_channels}) must be divisible by n_head ({n_head})'
-
-        self.time_enc   = TimeEncode(time_dim)
-        self.input_proj = torch.nn.Linear(in_channels, hidden_channels)
-        self.dropout    = dropout
-        self.n_layers   = n_layers
-
-        self.convs = torch.nn.ModuleList()
-        self.norms = torch.nn.ModuleList()
-
-        for _ in range(n_layers):
-            self.convs.append(
-                TransformerConv(
-                    in_channels  = hidden_channels,
-                    out_channels = hidden_channels // n_head,
-                    heads        = n_head,
-                    edge_dim     = time_dim,
-                    dropout      = dropout,
-                    concat       = True,
-                    beta         = False,
-                )
-            )
-            self.norms.append(torch.nn.BatchNorm1d(hidden_channels))
-
-        self.clf = torch.nn.Sequential(
-            torch.nn.Linear(hidden_channels, hidden_channels),
-            torch.nn.BatchNorm1d(hidden_channels),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_channels, hidden_channels // 2),
-            torch.nn.BatchNorm1d(hidden_channels // 2),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_channels // 2, 1),
-        )
-
-    def forward(
-        self,
-        x:          torch.Tensor,   # [N_sub, in_channels]
-        edge_index: torch.Tensor,   # [2, E_sub]
-        time:       torch.Tensor,   # [E_sub, 1]   raw edge timestamps  (graph.time)
-        node_time:  torch.Tensor,   # [N_sub]      node timestamps       (graph.node_time)
-        batch_size: int,
-    ) -> torch.Tensor:              # [batch_size]  logits
-
-        # ── relative time per edge ────────────────────────────────────────────
-        # time is [E] (1-D) as required by PyG's temporal NeighborLoader.
-        # Unsqueeze to [E, 1] for the subtraction and TimeEncode.
-        # rel_t = node_time[dst] - edge_time  →  [E, 1]
-        rel_t     = node_time[edge_index[1]] - time               # [E]
-        rel_t_enc = self.time_enc(rel_t.float().unsqueeze(1)).squeeze(1)  # [E, time_dim]
-
-        # ── input projection ──────────────────────────────────────────────────
-        h = F.relu(self.input_proj(x))                            # [N, hidden]
-
-        # ── conv layers ───────────────────────────────────────────────────────
-        for conv, norm in zip(self.convs, self.norms):
-            h = norm(conv(h, edge_index, edge_attr=rel_t_enc).relu())
-            h = F.dropout(h, p=self.dropout, training=self.training)
-
-        # ── classify seed nodes only ──────────────────────────────────────────
-        return self.clf(h[:batch_size]).squeeze(-1)               # [batch_size]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # TGAT with TGL Parallel Sampler
 # ─────────────────────────────────────────────────────────────────────────────
 class TGATSamplerModel(torch.nn.Module):
@@ -375,12 +277,17 @@ class TGATSamplerModel(torch.nn.Module):
         n_head:          int,
         time_dim:        int,
         dropout:         float = 0.2,
+        feature_augment: bool = False,
     ):
         super().__init__()
         assert hidden_channels % n_head == 0, \
             f'hidden_channels ({hidden_channels}) must be divisible by n_head ({n_head})'
 
         self.time_enc   = TimeEncode(time_dim)
+        self.feature_augment = feature_augment
+        if self.feature_augment:
+            in_channels += 7
+
         self.input_proj = torch.nn.Linear(in_channels, hidden_channels)
         self.dropout    = dropout
         self.n_layers   = n_layers
@@ -413,6 +320,79 @@ class TGATSamplerModel(torch.nn.Module):
             torch.nn.Dropout(dropout),
             torch.nn.Linear(hidden_channels // 2, 1),
         )
+
+    def _augment_features(
+        self,
+        x_base:     torch.Tensor,   # [N_sub, base_in_channels]
+        # node_ids:   torch.Tensor,   # [N_sub]  global ids (unused here, kept for API)
+        edge_index: torch.Tensor,   # [2, E]   local index space
+        edge_dts:   torch.Tensor,   # [E]      Δt = query_ts[dst] - edge_ts
+        n_seeds:    int,
+    ) -> torch.Tensor:              # [N_sub, base_in_channels + N_EXTRA]
+        """
+        Compute structural and temporal features from the sampled subgraph
+        and concatenate with base node features.
+ 
+        All features are derived solely from edges the TGL sampler returned
+        (t_edge < t_query enforced by sampler) — no additional leakage risk.
+        Normalised using seed-node statistics only to avoid neighbour
+        distribution leakage.
+        """
+        n_sub  = x_base.shape[0]
+        device = x_base.device
+        src_l, dst_l = edge_index                        # [E] local indices
+ 
+        ones = torch.ones(src_l.shape[0], device=device)
+ 
+        # ── structural ────────────────────────────────────────────────────────
+        out_deg   = torch.zeros(n_sub, device=device).scatter_add_(0, src_l, ones)
+        in_deg    = torch.zeros(n_sub, device=device).scatter_add_(0, dst_l, ones)
+        deg_ratio = out_deg / (in_deg + 1.0)             # avoids div-by-zero
+ 
+        # ── temporal (edge_dts = query_ts[dst] - edge_ts, larger = older) ────
+        INF = torch.full((n_sub,), 1e9, device=device)
+ 
+        # most recent edge per dst: smallest dts value
+        min_dts = INF.clone().scatter_reduce_(
+            0, dst_l, edge_dts, reduce='amin', include_self=True
+        )
+        # oldest edge per dst: largest dts value
+        max_dts = torch.zeros(n_sub, device=device).scatter_reduce_(
+            0, dst_l, edge_dts, reduce='amax', include_self=True
+        )
+        # recency: how recent is the node's newest valid edge
+        recency = min_dts.clamp(max=1e8)                 # cap sentinels
+ 
+        # burst ratio: fraction of edges in the most recent 25% of activity window
+        activity_window = (max_dts - min_dts).clamp(min=1.0)
+        burst_cutoff    = min_dts + 0.25 * activity_window   # [N_sub]
+        is_burst        = (edge_dts <= burst_cutoff[dst_l]).float()
+        burst_count     = torch.zeros(n_sub, device=device).scatter_add_(
+            0, dst_l, is_burst
+        )
+        burst_ratio = burst_count / in_deg.clamp(min=1.0)
+ 
+        # mean and std of dts per dst node (temporal diversity of neighbourhood)
+        mean_dts = torch.zeros(n_sub, device=device).scatter_reduce_(
+            0, dst_l, edge_dts, reduce='mean', include_self=False
+        )
+        dts_sq   = torch.zeros(n_sub, device=device).scatter_reduce_(
+            0, dst_l, edge_dts ** 2, reduce='mean', include_self=False
+        )
+        std_dts  = (dts_sq - mean_dts ** 2).clamp(min=0).sqrt()
+ 
+        # ── stack extra features ──────────────────────────────────────────────
+        extra = torch.stack([
+            out_deg, in_deg, deg_ratio,
+            recency, burst_ratio, mean_dts, std_dts,
+        ], dim=1).float()                                # [N_sub, N_EXTRA]
+ 
+        # normalise using seed-node mean/std to avoid neighbour dist leakage
+        mean = extra[:n_seeds].mean(0)
+        std  = extra[:n_seeds].std(0).clamp(min=1e-8)
+        extra = (extra - mean) / std
+ 
+        return torch.cat([x_base, extra], dim=1)         # [N_sub, base+N_EXTRA]
  
     def forward(
         self,
@@ -431,6 +411,11 @@ class TGATSamplerModel(torch.nn.Module):
  
         # Look up node features from global matrix
         x = x_all[node_ids]              # [N_sub, in_channels]
+        # feature augment
+        if self.feature_augment:
+            x      = self._augment_features(
+                x, edge_index, dts, batch_size
+            )
  
         # ── time encoding ─────────────────────────────────────────────────────
         # dts is already Δt per edge from the TGL sampler — feed directly to
@@ -543,101 +528,6 @@ class SMPConv(MessagePassing):
         q = 1.0 - p
         return (p-q) * h_i  # signed message
     
-    
-
-
-class THEGCNModel(torch.nn.Module):
-    """
-    Temporal Heterophilic Graph Convolutional Network (THEGCN).
-    Yan et al., 2025  (arXiv:2412.16435)
- 
-    Parameters
-    ----------
-    in_channels : int
-        Raw node feature dimension (17 for DGraphFin).
-    hidden_channels : int
-        Hidden dimension for the SMP layers and classifier.
-    n_smp_layers : int
-        Number of SMP layers (L in the paper). 0 = TMP only.
-    time_dim : int
-        Dimension of the sinusoidal time encoding E(Δt).
-    dropout : float
-        Dropout applied after TMP and each SMP layer, and in the classifier.
-    """
-
-    def __init__(
-        self,
-        in_channels:     int,
-        hidden_channels: int,
-        n_smp_layers:    int,
-        time_dim:        int,
-        dropout:         float = 0.2,
-    ):
-        super().__init__()
-
-        self.time_enc = TimeEncode(time_dim)
-        self.dropout = dropout
-        self.n_smp_layers = n_smp_layers
-
-        # TMP block
-        self.tmp = TMPConv(in_channels=in_channels, time_dim=time_dim)
-
-        # linear projection to hidden dimension for SMP block
-        self.input_proj = torch.nn.Linear(in_channels, hidden_channels)
-
-        # SMP blocks: L layers of static heterophily-aware message passing
-        self.smp_convs = torch.nn.ModuleList(
-            [SMPConv(hidden_channels=hidden_channels) for _ in range(n_smp_layers)]
-        )
-
-        self.smp_norms = torch.nn.ModuleList(
-            [torch.nn.BatchNorm1d(hidden_channels) for _ in range(n_smp_layers)]
-        )
-
-        # classifier MLP - same structure as static GNN baselines
-        self.clf = torch.nn.Sequential(
-            torch.nn.Linear(hidden_channels, hidden_channels),
-            torch.nn.BatchNorm1d(hidden_channels),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_channels, hidden_channels // 2),
-            torch.nn.BatchNorm1d(hidden_channels // 2),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_channels // 2, 1),
-        )
-
-    def forward(
-            self,
-            x:          torch.Tensor,   # [N_sub, in_channels]
-            edge_index: torch.Tensor,   # [2, E_sub]
-            time:       torch.Tensor,   # [E_sub, 1]   raw edge timestamps  (graph.time)
-            node_time:  torch.Tensor,   # [N_sub]      node timestamps       (
-            batch_size: int,
-    ) -> torch.Tensor:              # [batch_size]  logits
-
-        # time encoding 
-        # node_time[dst] is the query time for each destination node
-        # rel_t = query_time[dst] - edge_time (= t\'_dst - t_edge)
-        dst = edge_index[1]
-        rel_t = node_time[dst] - time
-        rel_t_enc = self.time_enc(rel_t.float().unsqueeze(1)).squeeze(1)  # [E, time_dim]
-
-        # TMP block
-        h = self.tmp(x, edge_index, rel_t_enc)
-        h = F.dropout(h, p=self.dropout, training=self.training)
-
-        # project to hidden dim before SMP
-        h = F.relu(self.input_proj(h))
-
-        # SMP block
-        for conv, norm in zip(self.smp_convs, self.smp_norms):
-            h = norm(F.relu(conv(h, edge_index)))
-            h = F.dropout(h, p=self.dropout, training=self.training)
-
-        # classify seed nodes only
-        return self.clf(h[:batch_size]).squeeze(-1)               # [batch size]
-    
 
 # ─────────────────────────────────────────────────────────────────────────────
 # THEGCN with TGL Parallel Sampler
@@ -671,11 +561,16 @@ class THEGCNSamplerModel(torch.nn.Module):
         n_smp_layers:    int,
         time_dim:        int,
         dropout:         float = 0.2,
+        feature_augment: bool = False,
     ):
         super().__init__()
         self.time_enc     = TimeEncode(time_dim)
         self.dropout      = dropout
         self.n_smp_layers = n_smp_layers
+        self.feature_augment = feature_augment
+        
+        if self.feature_augment:
+            in_channels += 7
  
         # TMP block: operates on raw node features
         self.tmp = TMPConv(in_channels=in_channels, time_dim=time_dim)
@@ -703,6 +598,79 @@ class THEGCNSamplerModel(torch.nn.Module):
             torch.nn.Dropout(dropout),
             torch.nn.Linear(hidden_channels // 2, 1),
         )
+
+    def _augment_features(
+        self,
+        x_base:     torch.Tensor,   # [N_sub, base_in_channels]
+        # node_ids:   torch.Tensor,   # [N_sub]  global ids (unused here, kept for API)
+        edge_index: torch.Tensor,   # [2, E]   local index space
+        edge_dts:   torch.Tensor,   # [E]      Δt = query_ts[dst] - edge_ts
+        n_seeds:    int,
+    ) -> torch.Tensor:              # [N_sub, base_in_channels + N_EXTRA]
+        """
+        Compute structural and temporal features from the sampled subgraph
+        and concatenate with base node features.
+ 
+        All features are derived solely from edges the TGL sampler returned
+        (t_edge < t_query enforced by sampler) — no additional leakage risk.
+        Normalised using seed-node statistics only to avoid neighbour
+        distribution leakage.
+        """
+        n_sub  = x_base.shape[0]
+        device = x_base.device
+        src_l, dst_l = edge_index                        # [E] local indices
+ 
+        ones = torch.ones(src_l.shape[0], device=device)
+ 
+        # ── structural ────────────────────────────────────────────────────────
+        out_deg   = torch.zeros(n_sub, device=device).scatter_add_(0, src_l, ones)
+        in_deg    = torch.zeros(n_sub, device=device).scatter_add_(0, dst_l, ones)
+        deg_ratio = out_deg / (in_deg + 1.0)             # avoids div-by-zero
+ 
+        # ── temporal (edge_dts = query_ts[dst] - edge_ts, larger = older) ────
+        INF = torch.full((n_sub,), 1e9, device=device)
+ 
+        # most recent edge per dst: smallest dts value
+        min_dts = INF.clone().scatter_reduce_(
+            0, dst_l, edge_dts, reduce='amin', include_self=True
+        )
+        # oldest edge per dst: largest dts value
+        max_dts = torch.zeros(n_sub, device=device).scatter_reduce_(
+            0, dst_l, edge_dts, reduce='amax', include_self=True
+        )
+        # recency: how recent is the node's newest valid edge
+        recency = min_dts.clamp(max=1e8)                 # cap sentinels
+ 
+        # burst ratio: fraction of edges in the most recent 25% of activity window
+        activity_window = (max_dts - min_dts).clamp(min=1.0)
+        burst_cutoff    = min_dts + 0.25 * activity_window   # [N_sub]
+        is_burst        = (edge_dts <= burst_cutoff[dst_l]).float()
+        burst_count     = torch.zeros(n_sub, device=device).scatter_add_(
+            0, dst_l, is_burst
+        )
+        burst_ratio = burst_count / in_deg.clamp(min=1.0)
+ 
+        # mean and std of dts per dst node (temporal diversity of neighbourhood)
+        mean_dts = torch.zeros(n_sub, device=device).scatter_reduce_(
+            0, dst_l, edge_dts, reduce='mean', include_self=False
+        )
+        dts_sq   = torch.zeros(n_sub, device=device).scatter_reduce_(
+            0, dst_l, edge_dts ** 2, reduce='mean', include_self=False
+        )
+        std_dts  = (dts_sq - mean_dts ** 2).clamp(min=0).sqrt()
+ 
+        # ── stack extra features ──────────────────────────────────────────────
+        extra = torch.stack([
+            out_deg, in_deg, deg_ratio,
+            recency, burst_ratio, mean_dts, std_dts,
+        ], dim=1).float()                                # [N_sub, N_EXTRA]
+ 
+        # normalise using seed-node mean/std to avoid neighbour dist leakage
+        mean = extra[:n_seeds].mean(0)
+        std  = extra[:n_seeds].std(0).clamp(min=1e-8)
+        extra = (extra - mean) / std
+ 
+        return torch.cat([x_base, extra], dim=1)         # [N_sub, base+N_EXTRA]
  
     def forward(
         self,
@@ -714,13 +682,17 @@ class THEGCNSamplerModel(torch.nn.Module):
         # batch_inputs[layer][hist=0] = dict with node_ids, edge_index, edge_dts
         # innermost layer = batch_inputs[-1][0]
         inner = batch_inputs[-1][0]
- 
         node_ids   = inner['node_ids']    # [N_sub]  global node ids
         edge_index = inner['edge_index']  # [2, E]   local index space
         dts        = inner['edge_dts']    # [E]      Δt = query_ts[dst] - edge_ts
  
         # Look up node features from global matrix
         x = x_all[node_ids]              # [N_sub, in_channels]
+        # feature augment
+        if self.feature_augment:
+            x      = self._augment_features(
+                x, edge_index, dts, batch_size
+            )                                                                # [N_sub, base+N_EXTRA]
  
         # ── time encoding ─────────────────────────────────────────────────────
         # dts is already Δt per edge from the TGL sampler — feed directly to
