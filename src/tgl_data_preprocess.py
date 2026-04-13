@@ -118,7 +118,7 @@ for idx, row in tqdm(df.iterrows(), total=len(df)):
             int_train_ts[dst].append(row['time'])
             int_train_eid[dst].append(idx)
         # int_train_indptr[src + 1:] += 1
-    if row['ext_roll'] != 3:
+    if row['ext_roll'] != 2:                    # validation data (include all training edges + validation edges)
         int_full_indices[src].append(dst)
         int_full_ts[src].append(row['time'])
         int_full_eid[src].append(idx)

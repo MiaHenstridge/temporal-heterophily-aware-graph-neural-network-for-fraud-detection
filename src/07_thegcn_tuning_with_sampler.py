@@ -48,7 +48,7 @@ faulthandler.enable()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import THEGCNModel, THEGCNSamplerModel
+from models import THEGCNSamplerModel
 from utils import *
 from namespaces import DA
 from dgraphfin import load_dgraphfin_temporal
@@ -195,30 +195,30 @@ logger.info(
 logger.info(f'Train fraud rate: {train_labels_np.mean():.4f}')
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Load CSC sampler data and build TemporalSampler
+# Load CSC sampler data for sampler (separate for train/val/test)
 # ─────────────────────────────────────────────────────────────────────────────
 
-logger.info(f'Loading CSC sampler data from {args.sampler_dir}...')
-g, df = load_graph(args.sampler_dir)
-
-assert len(g['indptr']) == x_all.shape[0] + 1
+logger.info(f'Loading CSC sampler data from {args.sampler_dir} for train/val/tests...')
+# build all three samplers once before training
+g_train, _ = load_graph(args.sampler_dir, mode='train')
+g_val, _   = load_graph(args.sampler_dir, mode='val')
+g_test, _  = load_graph(args.sampler_dir, mode='test')
 
 # num_neighbors per layer: outer → inner, linearly decreasing
-if NUM_LAYER == 0:
-    num_neighbors = []      # TMP only
-elif NUM_LAYER == 1:
+if NUM_LAYER == 1:
     num_neighbors = [NUM_NEIGHBOR]
-elif NUM_LAYER == 2:
-    num_neighbors = [NUM_NEIGHBOR, 5]
+# elif NUM_LAYER == 2:
+#     num_neighbors = [NUM_NEIGHBOR, 5]
 else:
-    step = max(1, (NUM_NEIGHBOR - 5) // (NUM_LAYER - 1))
-    num_neighbors = [max(5, NUM_NEIGHBOR - i * step) for i in range(NUM_LAYER)]
+    # step = max(1, (NUM_NEIGHBOR - 5) // (NUM_LAYER - 1))
+    # num_neighbors = [max(5, NUM_NEIGHBOR - i * step) for i in range(NUM_LAYER)]
+    num_neighbors = [NUM_NEIGHBOR] * NUM_LAYER
 
-sampler = ParallelSampler(
-    g['indptr'], 
-    g['indices'], 
-    g['eid'], 
-    g['ts'].astype(np.float32),
+sampler_train = ParallelSampler(
+    g_train['indptr'], 
+    g_train['indices'], 
+    g_train['eid'], 
+    g_train['ts'].astype(np.float32),
     NUM_THREADS, 
     NUM_WORKERS,                               # num_workers
     NUM_LAYER, 
@@ -228,8 +228,37 @@ sampler = ParallelSampler(
     HISTORY, 
     float(DURATION)
 )
-logger.info(f'Sampler: {sampler}')
-logger.info(f'NeighborLoader fanouts (outer→inner): {num_neighbors}')
+
+sampler_val   = ParallelSampler(
+    g_val['indptr'], 
+    g_val['indices'], 
+    g_val['eid'], 
+    g_val['ts'].astype(np.float32),
+    NUM_THREADS, 
+    NUM_WORKERS,                               # num_workers
+    NUM_LAYER, 
+    num_neighbors,
+    STRATEGY=='recent', 
+    PROP_TIME,
+    HISTORY, 
+    float(DURATION)
+)
+
+sampler_test  = ParallelSampler(
+    g_test['indptr'], 
+    g_test['indices'], 
+    g_test['eid'], 
+    g_test['ts'].astype(np.float32),
+    NUM_THREADS, 
+    NUM_WORKERS,                               # num_workers
+    NUM_LAYER, 
+    num_neighbors,
+    STRATEGY=='recent', 
+    PROP_TIME,
+    HISTORY, 
+    float(DURATION)
+)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Device
@@ -288,8 +317,12 @@ scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def eval_nodes(split_idx, criterion):
+def eval_nodes(split_idx, criterion, sampler):
     model.eval()
+
+    if sampler is not None:
+        sampler.reset()
+        
     all_preds, all_labels = [], []
 
     # iterate in batches
@@ -364,8 +397,8 @@ with mlflow.start_run():
         time_prep = 0
         m_loss = []
 
-        if sampler is not None:
-            sampler.reset()
+        if sampler_train is not None:
+            sampler_train.reset()
         
         # shuffle training indices each epoch
         perm     = np.random.permutation(len(train_idx_np))
@@ -377,8 +410,8 @@ with mlflow.start_run():
             root_nodes = batch_idx.astype(np.int32)
             ts         = node_time_all[batch_idx].cpu().numpy().astype(np.float32)
             # sampling
-            sampler.sample(root_nodes, ts)
-            ret = sampler.get_ret()
+            sampler_train.sample(root_nodes, ts)
+            ret = sampler_train.get_ret()
             time_sample += ret[0].sample_time()
             
             # message flow graphs from sampled blocks
@@ -402,7 +435,7 @@ with mlflow.start_run():
             m_loss.append(loss.item())
             pbar.set_postfix({'loss': f'{np.mean(m_loss):.4f}'})
 
-        val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, val_loss = eval_nodes(val_idx, criterion)
+        val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, val_loss = eval_nodes(val_idx, criterion, sampler_val)
         scheduler.step(val_auc)
 
 
@@ -440,7 +473,7 @@ with mlflow.start_run():
                 last_saved_epoch = epoch
 
     # ── final test ───────────────────────────────────────────────────────────
-    test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, _ = eval_nodes(test_idx, criterion)
+    test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, _ = eval_nodes(test_idx, criterion, sampler_test)
     logger.info(
         f'Test | auc: {test_auc:.4f} | ap: {test_ap:.4f} | '
         f'f1: {test_f1:.4f} | mcc: {test_mcc:.4f} | '

@@ -47,7 +47,7 @@ faulthandler.enable()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import TGATModel, TGATSamplerModel
+from models import TGATSamplerModel
 from utils import *
 from namespaces import DA
 from dgraphfin import load_dgraphfin_temporal
@@ -204,11 +204,11 @@ logger.info(
 logger.info(f'Train fraud rate: {train_labels_np.mean():.4f}')
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Load CSC sampler data and build TemporalSampler
+# Load CSC sampler data and build TemporalSampler for training
 # ─────────────────────────────────────────────────────────────────────────────
 
-logger.info(f'Loading CSC sampler data from {args.sampler_dir}...')
-g, df = load_graph(args.sampler_dir)
+logger.info(f'Loading CSC sampler data from {args.sampler_dir} for training...')
+g, df = load_graph(args.sampler_dir, mode='train')
 
 assert len(g['indptr']) == x_all.shape[0] + 1
 
@@ -298,8 +298,29 @@ scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def eval_nodes(split_idx, criterion):
+def eval_nodes(split_idx, criterion, mode='val'):
     model.eval()
+    # load data for sampler in validation mode & build sampler using that loaded data
+    g, df = load_graph(args.sampler_dir, mode=mode)
+
+    sampler = ParallelSampler(
+        g['indptr'], 
+        g['indices'], 
+        g['eid'], 
+        g['ts'].astype(np.float32),
+        NUM_THREADS, 
+        NUM_WORKERS,                               # num_workers
+        NUM_LAYER, 
+        num_neighbors,
+        STRATEGY=='recent', 
+        PROP_TIME,
+        HISTORY, 
+        float(DURATION)
+    )
+
+    if sampler is not None:
+        sampler.reset()
+
     all_preds, all_labels = [], []
 
     # iterate in batches
@@ -414,7 +435,7 @@ with mlflow.start_run():
             m_loss.append(loss.item())
             pbar.set_postfix({'loss': f'{np.mean(m_loss):.4f}'})
 
-        val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, val_loss = eval_nodes(val_idx, criterion)
+        val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, val_loss = eval_nodes(val_idx, criterion, mode='val')
         scheduler.step(val_auc)
 
 
@@ -452,7 +473,7 @@ with mlflow.start_run():
                 last_saved_epoch = epoch
 
     # ── final test ───────────────────────────────────────────────────────────
-    test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, _ = eval_nodes(test_idx, criterion)
+    test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, _ = eval_nodes(test_idx, criterion, mode='test')
     logger.info(
         f'Test | auc: {test_auc:.4f} | ap: {test_ap:.4f} | '
         f'f1: {test_f1:.4f} | mcc: {test_mcc:.4f} | '
@@ -498,7 +519,7 @@ with mlflow.start_run():
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
 
-    plt.title('THEGCN (TGL sampler) — Training Curve')
+    plt.title('TGAT (TGL sampler) — Training Curve')
     plt.tight_layout()
 
     plot_path = f'./saved_models/{args.prefix}-tgat-sampler-node-{DATA}-training-curve.png'

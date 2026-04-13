@@ -156,6 +156,36 @@ def recall_at_top_n_percent(y_true, y_scores, n_percent):
     return tp_k / total_positives
 
 
+def precision_at_top_n_percent(y_true, y_scores, n_percent):
+    """
+    Calculates Precision @ Top N% of predictions.
+    Ensures inputs are 1D to avoid dimensionality errors.
+    """
+    # Force inputs to be 1D arrays
+    y_true = np.array(y_true).ravel()
+    y_scores = np.array(y_scores).ravel()
+    
+    # Create a DataFrame for easy sorting
+    df = pd.DataFrame({'true': y_true, 'score': y_scores})
+    
+    # 1. Sort by score in descending order
+    df = df.sort_values(by='score', ascending=False).reset_index(drop=True)
+    
+    # 2. Determine the cutoff index k
+    n_rows = len(df)
+    k = int(np.ceil((n_percent / 100.0) * n_rows))
+    
+    # 3. Identify positives in the top k and predictions in top k
+    tp_k = df['true'].iloc[:k].sum()
+    total_predictions_k = k
+    
+    if total_predictions_k == 0:
+        return 0.0
+        
+    return tp_k / total_predictions_k
+
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Static graph feature augmentation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -201,9 +231,16 @@ def augment_static_features(x, edge_index, train_idx):
 # ─────────────────────────────────────────────────────────────────────────────
 # Load temporal graph for Temporal Parallel Sampler
 # ─────────────────────────────────────────────────────────────────────────────
-def load_graph(data_dir):
+def load_graph(data_dir, mode='test'):
     df = pd.read_csv(f'{data_dir}/edges.csv')
-    g = np.load(f'{data_dir}/ext_full.npz')
+    if mode =='train':
+        g = np.load(f'{data_dir}/int_train.npz')
+    elif mode=='val':
+        g = np.load(f'{data_dir}/int_full.npz')
+    elif mode=='test':
+        g = np.load(f'{data_dir}/ext_full.npz')
+    else:
+        raise ValueError(f"mode must be 'train', 'val', or 'test'")
     return g, df
 
 
