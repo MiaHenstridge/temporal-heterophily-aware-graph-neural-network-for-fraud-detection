@@ -7,7 +7,8 @@ from sklearn.metrics import (
     precision_score, 
     recall_score, 
     f1_score, 
-    matthews_corrcoef
+    matthews_corrcoef,
+    average_precision_score
 )
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.pipeline import Pipeline
@@ -51,11 +52,12 @@ def load_data(data_path):
 
 def eval_metrics(actual, pred_labels, pred_probas):
     auc = roc_auc_score(actual, pred_probas)
+    ap = average_precision_score(actual, pred_probas)
     recall = recall_score(actual, pred_labels)
     precision = precision_score(actual, pred_labels)
     f1 = recall_score(actual, pred_labels)
     matthews_corr = matthews_corrcoef(actual, pred_labels)
-    return auc, recall, precision, f1, matthews_corr
+    return auc, ap, recall, precision, f1, matthews_corr
 
 
 def objective(trial):
@@ -88,11 +90,12 @@ def objective(trial):
         y_prob = model.predict_proba(X_val)[:, 1]
         y_pred = model.predict(X_val)
     
-        auc, recall, precision, f1, mcc = eval_metrics(y_val, y_pred, y_prob)
+        auc, ap, recall, precision, f1, mcc = eval_metrics(y_val, y_pred, y_prob)
         # log params
         mlflow.log_params(param_grid_)
         # log metrics
         mlflow.log_metric("auc", float(auc))
+        mlflow.log_metric("ap", float(ap))
         mlflow.log_metric("recall", float(recall))
         mlflow.log_metric("precision", float(precision))
         mlflow.log_metric("f1", float(f1))
@@ -100,7 +103,7 @@ def objective(trial):
         # log model
         mlflow.xgboost.log_model(model, "model")
         
-    return auc
+    return ap
 
 
 if __name__ == '__main__':
@@ -134,6 +137,6 @@ if __name__ == '__main__':
 
         # log best results at parent level
         mlflow.log_params(study.best_params)
-        mlflow.log_metric("auc", study.best_value)
+        mlflow.log_metric("ap", study.best_value)
         
     print("\nRuns complete. Run 'mlflow ui' to compare the runs.")
