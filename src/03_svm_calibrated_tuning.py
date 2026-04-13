@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import os
 
-from sklearn.metrics import roc_auc_score, precision_score, recall_score, f1_score, matthews_corrcoef
+from sklearn.metrics import roc_auc_score, precision_score, recall_score, f1_score, matthews_corrcoef, average_precision_score
 from sklearn.svm import LinearSVC
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import MinMaxScaler
@@ -43,11 +43,12 @@ def load_data(data_path):
 
 def eval_metrics(actual, pred_labels, pred_probas):
     auc = roc_auc_score(actual, pred_probas)
+    ap = average_precision_score(actual, pred_probas)
     recall = recall_score(actual, pred_labels)
     precision = precision_score(actual, pred_labels)
     f1 = recall_score(actual, pred_labels)
     matthews_corr = matthews_corrcoef(actual, pred_labels)
-    return auc, recall, precision, f1, matthews_corr
+    return auc, ap, recall, precision, f1, matthews_corr
 
 
 def build_svm_model(C=1.0, loss='hinge', class_weight={0: 0.5, 1: 0.5}, random_state=42):
@@ -122,7 +123,7 @@ if __name__ == "__main__":
             # Eval
             scores = model.predict_proba(X_val)[:,1]
             labels = model.predict(X_val)
-            auc, recall, precision, f1, mcc = eval_metrics(y_val, labels, scores)
+            auc, ap, recall, precision, f1, mcc = eval_metrics(y_val, labels, scores)
             
             # 3. Log everything
             mlflow.log_params({
@@ -133,6 +134,7 @@ if __name__ == "__main__":
             
             mlflow.log_metrics({
                 "auc": auc,
+                "ap": ap,
                 "recall": recall,
                 "precision": precision,
                 "f1": f1,
@@ -140,6 +142,6 @@ if __name__ == "__main__":
             })
             
             mlflow.sklearn.log_model(model, "model")
-            print(f"Finished: {run_name} \nAUC: {auc:.4f} | Recall: {recall:.4f} | Precision: {precision:.4f} | F1: {f1:.4f} | MCC: {mcc:.4f}")
+            print(f"Finished: {run_name} \nAUC: {auc:.4f} | AP: {ap:.4f} | Recall: {recall:.4f} | Precision: {precision:.4f} | F1: {f1:.4f} | MCC: {mcc:.4f}")
 
     print("\nRuns complete. Run 'mlflow ui' to compare the runs.")

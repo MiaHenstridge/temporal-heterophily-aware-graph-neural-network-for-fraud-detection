@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import os
 
-from sklearn.metrics import roc_auc_score, precision_score, recall_score, f1_score, matthews_corrcoef
+from sklearn.metrics import roc_auc_score, precision_score, recall_score, f1_score, matthews_corrcoef, average_precision_score
 from sklearn.naive_bayes import GaussianNB
 
 import mlflow
@@ -54,11 +54,12 @@ def build_naive_bayes_model(priors: List[float]):
 
 def eval_metrics(actual, pred_labels, pred_probas):
     auc = roc_auc_score(actual, pred_probas)
+    ap = average_precision_score(actual, pred_probas)
     recall = recall_score(actual, pred_labels)
     precision = precision_score(actual, pred_labels)
     f1 = recall_score(actual, pred_labels)
     matthews_corr = matthews_corrcoef(actual, pred_labels)
-    return auc, recall, precision, f1, matthews_corr
+    return auc, ap, recall, precision, f1, matthews_corr
 
 
 def parse_priors_input(input_str):
@@ -105,7 +106,7 @@ if __name__ == "__main__":
             pred_labels = model.predict(X_val)
             
             # Metrics
-            auc, recall, precision, f1, matthews_corr = eval_metrics(
+            auc, ap, recall, precision, f1, matthews_corr = eval_metrics(
                 y_val, pred_labels=pred_labels, pred_probas=pred_probs
             )
             
@@ -113,6 +114,7 @@ if __name__ == "__main__":
             # We log the whole list as a string so MLflow displays it clearly
             mlflow.log_param("priors", str(p_set))
             mlflow.log_metric("auc", auc)
+            mlflow.log_metric("ap", ap)
             mlflow.log_metric("recall", recall)
             mlflow.log_metric("precision", precision)
             mlflow.log_metric("f1", f1)
@@ -121,6 +123,6 @@ if __name__ == "__main__":
             # Log the model
             mlflow.sklearn.log_model(model, "model")
             
-            print(f"Finished: {p_set} | AUC: {auc:.4f} | Recall: {recall:.4f} | Precision: {precision:.4f} | F1: {f1:.4f} | MCC: {matthews_corr:.4f}")
+            print(f"Finished: {p_set} | AUC: {auc:.4f} | AP: {ap:.4f} | Recall: {recall:.4f} | Precision: {precision:.4f} | F1: {f1:.4f} | MCC: {matthews_corr:.4f}")
 
     print("\nRuns complete. Run 'mlflow ui' to compare the runs.")
