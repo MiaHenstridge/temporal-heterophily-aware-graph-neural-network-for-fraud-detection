@@ -307,7 +307,7 @@ optimizer  = torch.optim.Adam(
     model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
 )
 scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-5
+    optimizer, mode='max', factor=0.3, patience=3, min_lr=1e-6
 )
 
 
@@ -431,12 +431,14 @@ with mlflow.start_run():
             loss = criterion(logits, labels)
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             m_loss.append(loss.item())
             pbar.set_postfix({'loss': f'{np.mean(m_loss):.4f}'})
 
+        # validation
         val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, val_loss = eval_nodes(val_idx, criterion, sampler_val)
-        scheduler.step(val_auc)
+        scheduler.step(val_ap)
 
 
         logger.info(
@@ -460,7 +462,7 @@ with mlflow.start_run():
         val_loss_hist.append(val_loss)
         val_auc_hist.append(val_auc)
 
-        if early_stopper.early_stop_check(val_loss):
+        if early_stopper.early_stop_check(val_ap):
             logger.info(f'Early stopping at epoch {epoch}')
             model.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch)))
             break
@@ -471,6 +473,20 @@ with mlflow.start_run():
                     os.remove(prev)
                 torch.save(model.state_dict(), get_checkpoint_path(epoch))
                 last_saved_epoch = epoch
+                # ── track best val metrics ────────────────────────────────
+                best_val_metrics = {
+                    'best_epoch':    epoch,
+                    'best_val_loss':      val_loss,
+                    'best_val_auc':       val_auc,
+                    'best_val_ap':        val_ap,
+                    'best_val_f1':        val_f1,
+                    'best_val_mcc':       val_mcc,
+                    'best_val_recall':    val_rc,
+                    'best_val_precision': val_pr,
+                }
+        
+    # ── log best val metrics and final test after training ends ──────────
+    mlflow.log_metrics(best_val_metrics)
 
     # ── final test ───────────────────────────────────────────────────────────
     test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, _ = eval_nodes(test_idx, criterion, sampler_test)
@@ -519,7 +535,7 @@ with mlflow.start_run():
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
 
-    plt.title('TGAT (TGL sampler) — Training Curve')
+    plt.title('THEGCN (TGL sampler) — Training Curve')
     plt.tight_layout()
 
     plot_path = f'./saved_models/{args.prefix}-thegcn-sampler-node-{DATA}-training-curve.png'
