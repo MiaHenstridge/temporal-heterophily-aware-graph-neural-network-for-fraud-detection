@@ -142,16 +142,15 @@ logger.info(f'Graph: {graph.num_nodes} nodes | {graph.num_edges} edges')
 device = torch.device(f'cuda:{GPU}' if torch.cuda.is_available() else 'cpu')
 
 ################## NeighborLoaders ##################
-# The reference repo uses sizes=[10, 5] for a 2-layer model.
-# We generalise: for 2 layers → [n_neighbor, 5]; otherwise a linearly
-# decreasing schedule from n_neighbor down to 5.
+# num neighbors per layer
 if NUM_LAYER == 1:
     num_neighbors = [NUM_NEIGHBOR]
-elif NUM_LAYER == 2:
-    num_neighbors = [NUM_NEIGHBOR, 5]
+# elif NUM_LAYER == 2:
+#     num_neighbors = [NUM_NEIGHBOR, 5]
 else:
-    step = max(1, (NUM_NEIGHBOR - 5) // (NUM_LAYER - 1))
-    num_neighbors = [max(5, NUM_NEIGHBOR - i * step) for i in range(NUM_LAYER)]
+    # step = max(1, (NUM_NEIGHBOR - 5) // (NUM_LAYER - 1))
+    # num_neighbors = [max(5, NUM_NEIGHBOR - i * step) for i in range(NUM_LAYER)]
+    num_neighbors = [NUM_NEIGHBOR] * NUM_LAYER
 
 logger.info(f'NeighborLoader fanouts (outer→inner): {num_neighbors}')
 
@@ -231,7 +230,7 @@ elif LOSS == 'focal':
 
 optimizer  = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-5
+    optimizer, mode='max', factor=0.3, patience=3, min_lr=1e-6
 )
 
 ################## eval ##################
@@ -297,13 +296,14 @@ with mlflow.start_run():
             loss = criterion(pred, label_batch)
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             m_loss.append(loss.item())
             pbar.set_postfix({'loss': f'{np.mean(m_loss):.4f}'})
 
         val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, val_loss = eval_nodes(val_loader, criterion)
-        scheduler.step(val_auc)
+        scheduler.step(val_ap)
 
         logger.info(
             f'Epoch {epoch} | loss: {np.mean(m_loss):.4f} | val_loss: {val_loss:.4f} | '
@@ -326,7 +326,7 @@ with mlflow.start_run():
         val_loss_hist.append(val_loss)
         val_auc_hist.append(val_auc)
 
-        if early_stopper.early_stop_check(val_loss):
+        if early_stopper.early_stop_check(val_ap):
             logger.info(f'Early stopping at epoch {epoch}')
             model.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch) + '.pt'))
             break
@@ -337,6 +337,21 @@ with mlflow.start_run():
                     os.remove(prev)
                 torch.save(model.state_dict(), get_checkpoint_path(epoch) + '.pt')
                 last_saved_epoch = epoch
+                # ── track best val metrics ────────────────────────────────
+                best_val_metrics = {
+                    'best_epoch':    epoch,
+                    'best_val_loss':      val_loss,
+                    'best_val_auc':       val_auc,
+                    'best_val_ap':        val_ap,
+                    'best_val_f1':        val_f1,
+                    'best_val_mcc':       val_mcc,
+                    'best_val_recall':    val_rc,
+                    'best_val_precision': val_pr,
+                }
+        
+    # ── log best val metrics and final test after training ends ──────────
+    mlflow.log_metrics(best_val_metrics)
+
 
     # ── final test ──────────────────────────────────────────────────────────
     test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, test_loss = eval_nodes(test_loader, criterion)
