@@ -59,6 +59,10 @@ os.makedirs(DA.paths.log,          exist_ok=True)
 os.makedirs('./saved_models',      exist_ok=True)
 os.makedirs('./saved_checkpoints', exist_ok=True)
 
+RANDOM_SEED = 1111
+
+set_seed(RANDOM_SEED)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────

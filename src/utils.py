@@ -3,9 +3,16 @@ import pandas as pd
 import torch
 import dgl
 import torch.nn.functional as F
+import random
 # from scipy.sparse import csr_matrix
 # from dgraphfin import load_dgraphfin_temporal
 # import sampler_core
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 ### Utility function and class
 class EarlyStopMonitor(object):
