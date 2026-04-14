@@ -42,4 +42,4 @@ src/sampler_tgl.py
 src/backup
 src/backup/*
 
-src/notebooks/*
+notebooks/*
