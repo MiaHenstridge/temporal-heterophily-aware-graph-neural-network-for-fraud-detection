@@ -67,7 +67,7 @@ parser.add_argument('-d', '--data',       type=str,   default='DGraphFin')
 parser.add_argument('--data_dir',         type=str,   default='./datasets')
 parser.add_argument('--sampler_dir',     type=str,   default='./processed_data/tgl',
                     help='Path to CSC graph .npz built by tgl_data_preprocess.py')
-parser.add_argument('--bs',               type=int,   default=1024)
+parser.add_argument('--bs',               type=int,   default=512)
 parser.add_argument('--n_epoch',          type=int,   default=100)
 parser.add_argument('--lr',               type=float, default=1e-3)
 parser.add_argument('--drop_out',         type=float, default=0.2)

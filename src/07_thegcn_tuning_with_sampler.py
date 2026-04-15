@@ -465,7 +465,7 @@ with mlflow.start_run():
 
         train_loss_hist.append(np.mean(m_loss))
         val_loss_hist.append(val_loss)
-        val_auc_hist.append(val_auc)
+        val_auc_hist.append(val_ap)
 
         if early_stopper.early_stop_check(val_ap):
             logger.info(f'Early stopping at epoch {epoch}')

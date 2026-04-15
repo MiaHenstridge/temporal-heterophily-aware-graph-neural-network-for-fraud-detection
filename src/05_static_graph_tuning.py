@@ -24,7 +24,7 @@ import mlflow
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from utils import EarlyStopMonitor, augment_static_features, BalancedFocalLoss
+from utils import *
 from namespaces import DA
 from dgraphfin import load_dgraphfin
 
@@ -33,7 +33,13 @@ os.makedirs(DA.paths.log, exist_ok=True)
 os.makedirs('./saved_models', exist_ok=True)
 os.makedirs('./saved_checkpoints', exist_ok=True)
 
-################## argument parser ##################
+RANDOM_SEED = 1111
+
+set_seed(RANDOM_SEED)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser('Static GNN Node Classification (GraphSAGE / GAT / GATv2)')
 parser.add_argument('-d', '--data',      type=str,   default='DGraphFin')
 parser.add_argument('--data_dir',        type=str,   default='./datasets',
@@ -102,10 +108,10 @@ NUM_WORKERS   = args.num_workers
 WEIGHT_DECAY  = args.weight_decay
 EARLY_STOP_HIGHER_BETTER = args.early_stop_higher_better
 
-MODEL_SAVE_PATH     = f'./saved_models/{args.prefix}-{MODEL_TYPE}-node-{DATA}.pth'
-get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{args.prefix}-{MODEL_TYPE}-node-{DATA}-{epoch}'
+# ─────────────────────────────────────────────────────────────────────────────
+# Logger
+# ─────────────────────────────────────────────────────────────────────────────
 
-################## logger ##################
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
@@ -120,7 +126,9 @@ logger.addHandler(fh)
 logger.addHandler(ch)
 logger.info(args)
 
-################## load & process data ##################
+# ─────────────────────────────────────────────────────────────────────────────
+# Load graph data (for node features, labels, masks, node_time)
+# ─────────────────────────────────────────────────────────────────────────────
 bundle = load_dgraphfin(data_dir=args.data_dir, fold=args.fold, to_undirected=False)
 
 graph         = bundle.graph
@@ -138,18 +146,18 @@ logger.info(f'Train nodes: {len(train_idx)} | Val nodes: {len(val_idx)} | Test n
 logger.info(f'Train fraud rate: {train_labels_np.mean():.4f}')
 logger.info(f'Graph: {graph.num_nodes} nodes | {graph.num_edges} edges')
 
-################## device ##################
+# ─────────────────────────────────────────────────────────────────────────────
+# Device
+# ─────────────────────────────────────────────────────────────────────────────
 device = torch.device(f'cuda:{GPU}' if torch.cuda.is_available() else 'cpu')
 
-################## NeighborLoaders ##################
+# ─────────────────────────────────────────────────────────────────────────────
+# NeighborLoader
+# ─────────────────────────────────────────────────────────────────────────────
 # num neighbors per layer
 if NUM_LAYER == 1:
     num_neighbors = [NUM_NEIGHBOR]
-# elif NUM_LAYER == 2:
-#     num_neighbors = [NUM_NEIGHBOR, 5]
 else:
-    # step = max(1, (NUM_NEIGHBOR - 5) // (NUM_LAYER - 1))
-    # num_neighbors = [max(5, NUM_NEIGHBOR - i * step) for i in range(NUM_LAYER)]
     num_neighbors = [NUM_NEIGHBOR] * NUM_LAYER
 
 logger.info(f'NeighborLoader fanouts (outer→inner): {num_neighbors}')
@@ -180,6 +188,10 @@ test_loader = NeighborLoader(
     shuffle       = False,
     num_workers   = NUM_WORKERS,
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model
+# ─────────────────────────────────────────────────────────────────────────────
 
 if MODEL_TYPE == 'sage':
     model = GraphSAGEModel(
@@ -215,7 +227,9 @@ else:                   #fagcn
 
 logger.info(f'Model: {MODEL_TYPE.upper()} | params: {sum(p.numel() for p in model.parameters()):,}')
 
-################## loss / optimiser ##################
+# ─────────────────────────────────────────────────────────────────────────────
+# Loss / optimiser
+# ─────────────────────────────────────────────────────────────────────────────
 if LOSS == 'bce':
     n_neg = (train_labels_np == 0).sum()
     n_pos = (train_labels_np == 1).sum()
@@ -228,12 +242,17 @@ elif LOSS == 'focal':
     criterion = BalancedFocalLoss(alpha=args.alpha, gamma=args.gamma, reduction=args.reduction).to(device)
 
 
-optimizer  = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+optimizer  = torch.optim.Adam(
+    model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+)
 scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode='max', factor=0.3, patience=3, min_lr=1e-6
 )
 
-################## eval ##################
+# ─────────────────────────────────────────────────────────────────────────────
+# Evaluation
+# ─────────────────────────────────────────────────────────────────────────────
+
 @torch.no_grad()
 def eval_nodes(loader, criterion):
     model.eval()
@@ -269,15 +288,28 @@ def eval_nodes(loader, criterion):
 
     return auc, ap, f1, mcc, rc, pr, val_loss
 
-################## training ##################
-early_stopper    = EarlyStopMonitor(max_round=MAX_ROUND, higher_better=EARLY_STOP_HIGHER_BETTER, tolerance=TOLERANCE)
+# ─────────────────────────────────────────────────────────────────────────────
+# Training loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+early_stopper    = EarlyStopMonitor(
+    max_round    = MAX_ROUND,
+    higher_better = EARLY_STOP_HIGHER_BETTER,
+    tolerance    = TOLERANCE,
+)
 last_saved_epoch = -1
 
 train_loss_hist = []
 val_loss_hist   = []
 val_auc_hist    = []
 
-mlflow.set_experiment(f'static-gnn-{MODEL_TYPE}')
+# create experiment
+EXPERIMENT_NAME = f'static-gnn-{MODEL_TYPE}'
+mlflow.set_experiment(EXPERIMENT_NAME)
+
+MODEL_SAVE_PATH     = f'./saved_models/{EXPERIMENT_NAME}-{args.prefix}-{DATA}.pth'
+get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{EXPERIMENT_NAME}-{args.prefix}-{DATA}.pt'
+
 with mlflow.start_run():
     mlflow.log_params(vars(args))
 
@@ -354,7 +386,11 @@ with mlflow.start_run():
 
 
     # ── final test ──────────────────────────────────────────────────────────
-    test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, test_loss = eval_nodes(test_loader, criterion)
+    # Reload the best checkpoint into the model before testing and final saving
+    logger.info(f"Loading best model from epoch {early_stopper.best_epoch} for testing.")
+    model.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch)))
+    
+    test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, _ = eval_nodes(test_loader, criterion)
     logger.info(
         f'Test | auc: {test_auc:.4f} | ap: {test_ap:.4f} | '
         f'f1: {test_f1:.4f} | mcc: {test_mcc:.4f} | '
@@ -372,38 +408,38 @@ with mlflow.start_run():
     torch.save(model.state_dict(), MODEL_SAVE_PATH)
     logger.info(f'Model saved to {MODEL_SAVE_PATH}')
 
-    # ── training curve plot ─────────────────────────────────────────────────
-    epochs_list = list(range(len(train_loss_hist)))
-    fig, ax1 = plt.subplots(figsize=(10, 5))
+    # # ── training curve plot ─────────────────────────────────────────────────
+    # epochs_list = list(range(len(train_loss_hist)))
+    # fig, ax1 = plt.subplots(figsize=(10, 5))
 
-    color_loss_train = '#e05c5c'
-    color_loss_val   = '#e09c5c'
-    color_auc        = '#5c8de0'
+    # color_loss_train = '#e05c5c'
+    # color_loss_val   = '#e09c5c'
+    # color_auc        = '#5c8de0'
 
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Train Loss', color=color_loss_train)
-    ax1.plot(epochs_list, train_loss_hist, color=color_loss_train, linewidth=2, label='Train Loss')
-    ax1.plot(epochs_list, val_loss_hist,   color=color_loss_val,   linewidth=2, linestyle='--', label='Val Loss')
-    ax1.tick_params(axis='y', labelcolor=color_loss_train)
+    # ax1.set_xlabel('Epoch')
+    # ax1.set_ylabel('Train Loss', color=color_loss_train)
+    # ax1.plot(epochs_list, train_loss_hist, color=color_loss_train, linewidth=2, label='Train Loss')
+    # ax1.plot(epochs_list, val_loss_hist,   color=color_loss_val,   linewidth=2, linestyle='--', label='Val Loss')
+    # ax1.tick_params(axis='y', labelcolor=color_loss_train)
 
-    ax2 = ax1.twinx()
-    ax2.set_ylabel('Val AUC', color=color_auc)
-    ax2.plot(epochs_list, val_auc_hist, color=color_auc, linewidth=2, linestyle='--', label='Val AUC')
-    ax2.tick_params(axis='y', labelcolor=color_auc)
-    ax2.set_ylim(0, 1)
+    # ax2 = ax1.twinx()
+    # ax2.set_ylabel('Val AUC', color=color_auc)
+    # ax2.plot(epochs_list, val_auc_hist, color=color_auc, linewidth=2, linestyle='--', label='Val AUC')
+    # ax2.tick_params(axis='y', labelcolor=color_auc)
+    # ax2.set_ylim(0, 1)
 
-    best_ep = early_stopper.best_epoch
-    ax2.axvline(x=best_ep, color='gray', linestyle=':', linewidth=1.5, label=f'Best epoch ({best_ep})')
+    # best_ep = early_stopper.best_epoch
+    # ax2.axvline(x=best_ep, color='gray', linestyle=':', linewidth=1.5, label=f'Best epoch ({best_ep})')
 
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
+    # lines1, labels1 = ax1.get_legend_handles_labels()
+    # lines2, labels2 = ax2.get_legend_handles_labels()
+    # ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
 
-    plt.title(f'{MODEL_TYPE.upper()} Node Classification — Training Curve (early stop on val loss)')
-    plt.tight_layout()
+    # plt.title(f'{MODEL_TYPE.upper()} Node Classification — Training Curve (early stop on val loss)')
+    # plt.tight_layout()
 
-    plot_path = f'./saved_models/{args.prefix}-{MODEL_TYPE}-node-{DATA}-training-curve.png'
-    plt.savefig(plot_path, dpi=150)
-    plt.close()
-    mlflow.log_artifact(plot_path)
-    logger.info(f'Training curve saved to {plot_path}')
+    # plot_path = f'./saved_models/{EXPERIMENT_NAME}-{args.prefix}-{DATA}-training-curve.png'
+    # plt.savefig(plot_path, dpi=150)
+    # plt.close()
+    # mlflow.log_artifact(plot_path)
+    # logger.info(f'Training curve saved to {plot_path}')
