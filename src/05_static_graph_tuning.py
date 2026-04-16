@@ -47,7 +47,7 @@ parser.add_argument('--data_dir',        type=str,   default='./datasets',
 parser.add_argument('--model',           type=str,   default='sage',
                     choices=['sage', 'gat', 'gatv2', 'fagcn'],
                     help='sage = GraphSAGE, gat = GAT, gatv2 = GATv2, fagcn = FAGCN')
-parser.add_argument('--bs',              type=int,   default=1024,
+parser.add_argument('--bs',              type=int,   default=512,
                     help='number of seed nodes per mini-batch')
 parser.add_argument('--n_epoch',         type=int,   default=100)
 parser.add_argument('--lr',              type=float, default=1e-3)
