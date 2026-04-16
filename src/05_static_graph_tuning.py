@@ -50,7 +50,7 @@ parser.add_argument('--model',           type=str,   default='sage',
 parser.add_argument('--bs',              type=int,   default=512,
                     help='number of seed nodes per mini-batch')
 parser.add_argument('--n_epoch',         type=int,   default=100)
-parser.add_argument('--lr',              type=float, default=1e-3)
+parser.add_argument('--lr',              type=float, default=1e-4)
 parser.add_argument('--drop_out',        type=float, default=0.2)
 parser.add_argument('--gpu',             type=int,   default=0)
 parser.add_argument('--n_layer',         type=int,   default=2)
@@ -314,6 +314,7 @@ get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{EXPERIMENT_NAME}-{arg
 
 with mlflow.start_run():
     mlflow.log_params(vars(args))
+    mlflow.set_tag("seed", RANDOM_SEED)
 
     for epoch in range(NUM_EPOCH):
         model.train()
@@ -362,14 +363,14 @@ with mlflow.start_run():
 
         if early_stopper.early_stop_check(val_ap):
             logger.info(f'Early stopping at epoch {epoch}')
-            model.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch) + '.pt'))
+            model.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch)))
             break
         else:
             if early_stopper.best_epoch == epoch:
-                prev = get_checkpoint_path(last_saved_epoch) + '.pt'
+                prev = get_checkpoint_path(last_saved_epoch)
                 if os.path.exists(prev):
                     os.remove(prev)
-                torch.save(model.state_dict(), get_checkpoint_path(epoch) + '.pt')
+                torch.save(model.state_dict(), get_checkpoint_path(epoch))
                 last_saved_epoch = epoch
                 # ── track best val metrics ────────────────────────────────
                 best_val_metrics = {
@@ -409,39 +410,3 @@ with mlflow.start_run():
 
     torch.save(model.state_dict(), MODEL_SAVE_PATH)
     logger.info(f'Model saved to {MODEL_SAVE_PATH}')
-
-    # # ── training curve plot ─────────────────────────────────────────────────
-    # epochs_list = list(range(len(train_loss_hist)))
-    # fig, ax1 = plt.subplots(figsize=(10, 5))
-
-    # color_loss_train = '#e05c5c'
-    # color_loss_val   = '#e09c5c'
-    # color_auc        = '#5c8de0'
-
-    # ax1.set_xlabel('Epoch')
-    # ax1.set_ylabel('Train Loss', color=color_loss_train)
-    # ax1.plot(epochs_list, train_loss_hist, color=color_loss_train, linewidth=2, label='Train Loss')
-    # ax1.plot(epochs_list, val_loss_hist,   color=color_loss_val,   linewidth=2, linestyle='--', label='Val Loss')
-    # ax1.tick_params(axis='y', labelcolor=color_loss_train)
-
-    # ax2 = ax1.twinx()
-    # ax2.set_ylabel('Val AUC', color=color_auc)
-    # ax2.plot(epochs_list, val_auc_hist, color=color_auc, linewidth=2, linestyle='--', label='Val AUC')
-    # ax2.tick_params(axis='y', labelcolor=color_auc)
-    # ax2.set_ylim(0, 1)
-
-    # best_ep = early_stopper.best_epoch
-    # ax2.axvline(x=best_ep, color='gray', linestyle=':', linewidth=1.5, label=f'Best epoch ({best_ep})')
-
-    # lines1, labels1 = ax1.get_legend_handles_labels()
-    # lines2, labels2 = ax2.get_legend_handles_labels()
-    # ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
-
-    # plt.title(f'{MODEL_TYPE.upper()} Node Classification — Training Curve (early stop on val loss)')
-    # plt.tight_layout()
-
-    # plot_path = f'./saved_models/{EXPERIMENT_NAME}-{args.prefix}-{DATA}-training-curve.png'
-    # plt.savefig(plot_path, dpi=150)
-    # plt.close()
-    # mlflow.log_artifact(plot_path)
-    # logger.info(f'Training curve saved to {plot_path}')

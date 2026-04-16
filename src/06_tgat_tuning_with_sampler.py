@@ -58,6 +58,10 @@ os.makedirs(DA.paths.log,          exist_ok=True)
 os.makedirs('./saved_models',      exist_ok=True)
 os.makedirs('./saved_checkpoints', exist_ok=True)
 
+RANDOM_SEED = 1111
+
+set_seed(RANDOM_SEED)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -389,6 +393,7 @@ get_checkpoint_path = lambda epoch: f'./saved_checkpoints/{EXPERIMENT_NAME}-{arg
 
 with mlflow.start_run():
     mlflow.log_params(vars(args))
+    mlflow.set_tag('seed', RANDOM_SEED)
     
     for epoch in range(NUM_EPOCH):
         logger.info(f"Epoch {epoch+1}:")
