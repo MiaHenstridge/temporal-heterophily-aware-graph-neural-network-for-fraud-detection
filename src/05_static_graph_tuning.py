@@ -130,6 +130,8 @@ logger.info(args)
 # Load graph data (for node features, labels, masks, node_time)
 # ─────────────────────────────────────────────────────────────────────────────
 bundle = load_dgraphfin(data_dir=args.data_dir, fold=args.fold, to_undirected=False)
+et = torch.tensor(np.load(os.path.join(args.data_dir, args.data, 'dgraphfinv2_edge_timestamp.npy')), dtype=torch.float32)
+nt = torch.tensor(np.load(os.path.join(args.data_dir, args.data, 'dgraphfinv2_node_timestamp.npy')), dtype=torch.float32)
 
 graph         = bundle.graph
 train_idx     = bundle.train_idx
@@ -139,7 +141,7 @@ train_labels_np = bundle.train_labels
 node_feat_dim = bundle.node_feat_dim
 
 if FEAT_AUGMENT:
-    graph.x       = augment_static_features(graph.x, graph.edge_index, train_idx)
+    graph.x       = augment_static_features(graph.x, graph.edge_index, train_idx, et, nt)
     node_feat_dim = graph.x.shape[1]
 
 logger.info(f'Train nodes: {len(train_idx)} | Val nodes: {len(val_idx)} | Test nodes: {len(test_idx)}')

@@ -197,29 +197,71 @@ def precision_at_top_n_percent(y_true, y_scores, n_percent):
 # Static graph feature augmentation
 # ─────────────────────────────────────────────────────────────────────────────
  
-def augment_static_features(x, edge_index, train_idx):
+def augment_static_features(x, edge_index, train_idx, edge_time=None, node_time=None):
     """
-    Compute degree-based structural features from the full directed graph
+    Compute structural and temporal features from the full directed graph
     and concatenate with base node features.
+ 
+    Mirrors the feature set used in THEGCNSamplerModel._augment_features
+    so static and temporal GNNs are compared on equal footing.
+ 
+    When edge_time and node_time are provided, a temporal filter is applied
+    so only edges with edge_time < node_time[dst] contribute to each node's
+    features — matching the TGL sampler's t_edge < t_query constraint.
  
     Parameters
     ----------
-    x          : FloatTensor [N, F]    base node features (on any device)
-    edge_index : LongTensor  [2, E]    DIRECTED edge index (src -> dst)
-                                        use the raw directed edges before
-                                        symmetrisation for meaningful
-                                        out_deg / in_deg separation
-    train_idx  : LongTensor  [N_train] training node indices
+    x          : FloatTensor [N, F]
+    edge_index : LongTensor  [2, E]   raw directed edge index (i→j,
+                                       applicant→contact from npz).
+                                       Flipped internally to j→i.
+    train_idx  : LongTensor  [N_train]
+    edge_time  : LongTensor or FloatTensor [E]   edge timestamps (optional)
+    node_time  : LongTensor or FloatTensor [N]   node query timestamps (optional)
  
     Returns
     -------
-    FloatTensor [N, F+3]   base features concatenated with normalised
-                            [out_deg, in_deg, deg_ratio]
+    FloatTensor [N, F+3]  if edge_time/node_time not provided (degree only)
+    FloatTensor [N, F+7]  if edge_time/node_time provided (degree + temporal)
+ 
+    Usage
+    -----
+    # in 05_static_graph_tuning.py, after load_dgraphfin():
+    import numpy as np
+    raw    = np.load('./datasets/DGraphFin/dgraphfin.npz')
+    ei_dir = torch.tensor(raw['edge_index'], dtype=torch.long).t().contiguous()
+    et     = torch.tensor(np.load('...dgraphfinv2_edge_timestamp.npy'), dtype=torch.float)
+    nt     = torch.tensor(np.load('...dgraphfinv2_node_timestamp.npy'), dtype=torch.float)
+    graph.x      = augment_static_features(graph.x, ei_dir, train_idx, et, nt)
+    node_feat_dim = graph.x.shape[1]
     """
     N      = x.shape[0]
     device = x.device
-    src, dst = edge_index[1].to(device), edge_index[0].to(device)  # flip to j -> i: contact -> applicant
  
+    # flip i→j to j→i (contact→applicant) to match temporal model convention
+    src = edge_index[1].to(device)   # j (contact)
+    dst = edge_index[0].to(device)   # i (applicant)
+ 
+    # ── temporal filter ───────────────────────────────────────────────────────
+    if edge_time is not None and node_time is not None:
+        et = edge_time.to(device).float()
+        nt = node_time.to(device).float()
+ 
+        # fix background node sentinels (large negatives → global max ts)
+        max_ts = et.max()
+        nt     = nt.clone()
+        nt[nt < 0] = max_ts
+ 
+        # keep only edges where edge_time < query_time[dst]
+        valid = et < nt[dst]
+        src   = src[valid]
+        dst   = dst[valid]
+        et    = et[valid]
+ 
+        # dts = query_time[dst] - edge_time (larger = older, matches sampler)
+        dts = (nt[dst] - et).float()   # [E_valid]
+ 
+    # ── structural features ───────────────────────────────────────────────────
     ones      = torch.ones(src.shape[0], device=device)
     out_deg   = torch.zeros(N, device=device).scatter_add_(0, src, ones)
     in_deg    = torch.zeros(N, device=device).scatter_add_(0, dst, ones)
@@ -227,12 +269,47 @@ def augment_static_features(x, edge_index, train_idx):
  
     extra = torch.stack([out_deg, in_deg, deg_ratio], dim=1).float()  # [N, 3]
  
-    # fit normalisation on training nodes only
+    # ── temporal features (mirrors _augment_features exactly) ─────────────────
+    if edge_time is not None and node_time is not None:
+        INF = torch.full((N,), 1e9, device=device)
+ 
+        # recency: min dts per dst (smallest = most recent), capped at 1e8
+        recency = INF.clone().scatter_reduce_(
+            0, dst, dts, reduce='amin', include_self=True
+        ).clamp(max=1e8)
+ 
+        # max dts per dst (oldest edge)
+        max_dts = torch.zeros(N, device=device).scatter_reduce_(
+            0, dst, dts, reduce='amax', include_self=True
+        )
+ 
+        # burst ratio: fraction of edges in most recent 25% of activity window
+        activity_window = (max_dts - recency).clamp(min=1.0)
+        burst_cutoff    = recency + 0.25 * activity_window
+        is_burst        = (dts <= burst_cutoff[dst]).float()
+        burst_count     = torch.zeros(N, device=device).scatter_add_(0, dst, is_burst)
+        burst_ratio     = burst_count / in_deg.clamp(min=1.0)
+ 
+        # mean and std of dts per dst node
+        mean_dts = torch.zeros(N, device=device).scatter_reduce_(
+            0, dst, dts, reduce='mean', include_self=False
+        )
+        dts_sq   = torch.zeros(N, device=device).scatter_reduce_(
+            0, dst, dts ** 2, reduce='mean', include_self=False
+        )
+        std_dts  = (dts_sq - mean_dts ** 2).clamp(min=0).sqrt()
+ 
+        temporal = torch.stack(
+            [recency, burst_ratio, mean_dts, std_dts], dim=1
+        ).float()                                          # [N, 4]
+        extra    = torch.cat([extra, temporal], dim=1)    # [N, 7]
+ 
+    # ── normalise on training nodes only ──────────────────────────────────────
     mean  = extra[train_idx].mean(0)
     std   = extra[train_idx].std(0).clamp(min=1e-8)
     extra = (extra - mean) / std
  
-    return torch.cat([x, extra], dim=1)   # [N, F+3]
+    return torch.cat([x, extra], dim=1)   # [N, F+3] or [N, F+7]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
