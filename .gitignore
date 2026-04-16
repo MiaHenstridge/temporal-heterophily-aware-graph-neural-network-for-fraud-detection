@@ -44,5 +44,5 @@ src/backup/*
 
 notebooks/*
 
-ablation/*
-ablation/
+hyperparameter_tuning/*
+hyperparameter_tuning/
