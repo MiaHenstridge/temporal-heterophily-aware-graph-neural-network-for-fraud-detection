@@ -9,11 +9,19 @@ time_dim=128
 neighbors=(5 10)
 durations=(0 730 365)
 layers=(2 3 4)
+feat_augment=false # Set to true or false
+
+# Logic to determine the flag string
+if [ "$feat_augment" = true ]; then
+    augment_flag="--feat_augment"
+else
+    augment_flag=""
+fi
 
 total_runs=$((${#layers[@]} * ${#durations[@]} * ${#neighbors[@]}))
 
 # Initialize run counter
-run_id=0
+run_id=18
 
 for l in "${layers[@]}"; do
     for d in "${durations[@]}"; do
@@ -29,14 +37,14 @@ for l in "${layers[@]}"; do
                 --lr "$lr" \
                 --bs "$bs" \
                 --n_epoch "$epochs" \
-                --feat_augment \
                 --loss focal \
                 --node_dim "$node_dim"\
                 --time_dim "$time_dim"\
                 --n_layer "$l" \
                 --duration "$d" \
                 --n_neighbor "$n" \
-                --early_stop_higher_better
+                --early_stop_higher_better \
+                $augment_flag
             
             # Increment counter for the next iteration
             ((run_id++))

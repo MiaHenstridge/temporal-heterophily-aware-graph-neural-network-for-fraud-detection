@@ -27,7 +27,7 @@ os.chdir('/home/mai/notebooks/final_thesis/')
 print(f"Current working directory: {os.getcwd()}")
 
 
-def load_data(data_path):
+def load_data(data_path, feat_augment=True):
     data = np.load(os.path.join(data_path, 'dgraphfin_processed.npz'))
     # train
     X_train = pd.DataFrame(data['x_train'])
@@ -38,6 +38,11 @@ def load_data(data_path):
     # test
     X_test = pd.DataFrame(data['x_test'])
     y_test = pd.DataFrame(data['y_test'])
+
+    if not feat_augment:
+        X_train = X_train.iloc[:, :17]
+        X_val = X_val.iloc[:, :17]
+        X_test = X_test.iloc[:, :17]
     return X_train, X_val, X_test, y_train, y_val, y_test
 
 
@@ -84,10 +89,11 @@ if __name__ == "__main__":
     parser.add_argument("--c_values", type=float, nargs="+", default=[0.1, 1.0, 10.0])
     parser.add_argument("--loss_values", type=str, nargs="+", default=["squared_hinge"])
     parser.add_argument("--weights", type=str, default="0.01,0.99|0.02,0.98|0.05,0.95|0.1,0.9")
+    parser.add_argument("--feat_augment", action='store_true', default=False)
     args = parser.parse_args()
 
     # Load data
-    X_train, X_val, X_test, y_train, y_val, y_test = load_data(data_path=DA.paths.output_data_ml)
+    X_train, X_val, X_test, y_train, y_val, y_test = load_data(data_path=DA.paths.output_data_ml, feat_augment=args.feat_augment)
     
     # 1. Define the Parameter Grid including Tolerance
     param_grid = {
@@ -129,7 +135,8 @@ if __name__ == "__main__":
             mlflow.log_params({
                 "C": params['C'],
                 "loss": params['loss'],
-                "class_weight": str(params['class_weight'])
+                "class_weight": str(params['class_weight']),
+                "feat_augment": args.feat_augment
             })
             
             mlflow.log_metrics({

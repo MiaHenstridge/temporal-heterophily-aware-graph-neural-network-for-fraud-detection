@@ -19,21 +19,11 @@ logging.basicConfig(level=logging.WARN)
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore")
 
-
-# DATA_PATH = './datasets/DGraphFin/'
-# os.makedirs(DATA_PATH, exist_ok=True)
-
-# OUTPUT_DATA_PATH = './processed_data'
-# os.makedirs(OUTPUT_DATA_PATH, exist_ok=True)
-
-# OUTPUT_DATA_ML = os.path.join(OUTPUT_DATA_PATH, 'baseline_ml')
-# os.makedirs(OUTPUT_DATA_ML, exist_ok=True)
-
 os.chdir('/home/mai/notebooks/final_thesis/')
 print(f"Current working dir: {os.getcwd()}")
 
 
-def load_data(data_path):
+def load_data(data_path, feat_augment=True):
     data = np.load(os.path.join(data_path, 'dgraphfin_processed.npz'))
     # train
     X_train = pd.DataFrame(data['x_train'])
@@ -44,6 +34,11 @@ def load_data(data_path):
     # test
     X_test = pd.DataFrame(data['x_test'])
     y_test = pd.DataFrame(data['y_test'])
+
+    if not feat_augment:
+        X_train = X_train.iloc[:, :17]
+        X_val = X_val.iloc[:, :17]
+        X_test = X_test.iloc[:, :17]
     return X_train, X_val, X_test, y_train, y_val, y_test
 
 
@@ -77,13 +72,14 @@ if __name__ == "__main__":
     parser.add_argument("--priors_sweep", type=str, 
                         default="0.99,0.01|0.98,0.02|0.95,0.05|0.90,0.10|0.50,0.50",
                         help="Sets of priors separated by | (e.g. '0.9,0.1|0.8,0.2')")
+    parser.add_argument("--feat_augment", action='store_true', default=False)
     args = parser.parse_args()
     
     # Parse the string into a list of lists
     priors_to_test = parse_priors_input(args.priors_sweep)
     
     # 2. Load data ONCE
-    X_train, X_val, X_test, y_train, y_val, y_test = load_data(data_path=DA.paths.output_data_ml)
+    X_train, X_val, X_test, y_train, y_val, y_test = load_data(data_path=DA.paths.output_data_ml, feat_augment=args.feat_augment)
     
     # 3. Set MLflow Experiment
     mlflow.set_experiment(experiment_name="nb_priors_tuning")
@@ -113,6 +109,8 @@ if __name__ == "__main__":
             # Log to MLflow
             # We log the whole list as a string so MLflow displays it clearly
             mlflow.log_param("priors", str(p_set))
+            mlflow.log_param("feat_augment", args.feat_augment)
+            
             mlflow.log_metric("auc", auc)
             mlflow.log_metric("ap", ap)
             mlflow.log_metric("recall", recall)
