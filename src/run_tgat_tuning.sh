@@ -7,9 +7,9 @@ epochs=200
 heads=4
 node_dim=128
 time_dim=128
-neighbors=(5 10)
-durations=(0 730 365)
-layers=(2 3 4)
+neighbors=(3 5 10)
+durations=(730 365 180 90 30)
+layers=(1 2 3)
 # Added array for augmentation options
 feat_aug_options=(true false) 
 

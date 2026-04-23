@@ -1,7 +1,7 @@
 """
-07_thegcn_tuning.py
+06_tgat_tuning.py
 ===================
-THEGCN training script using the TGL C++ parallel sampler for temporally-
+TGAT training script using the TGL C++ parallel sampler for temporally-
 correct neighbourhood sampling.
 
 Prerequisites
@@ -13,9 +13,8 @@ Prerequisites
        python src/tgl_data_preprocess.py
 
 3. Run training:
-       python src/07_thegcn_tuning_with_sampler.py --prefix run1 --n_epoch 50 --bs 1024 \\
+       python src/06_tgat_tuning_with_sampler.py --prefix run1 --n_epoch 50 --bs 1024 \\
            --n_layer 2 --node_dim 128 --time_dim 100 --n_neighbor 10 --gpu 0
-
 """
 
 import os
@@ -48,7 +47,7 @@ faulthandler.enable()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import THEGCNSamplerModel, THEGCNModel
+from models import TGATSamplerModel, TGATModel
 from utils import *
 from namespaces import DA
 from dgraphfin import load_dgraphfin_temporal
@@ -59,12 +58,15 @@ os.makedirs(DA.paths.log,          exist_ok=True)
 os.makedirs('./saved_models',      exist_ok=True)
 os.makedirs('./saved_checkpoints', exist_ok=True)
 
+RANDOM_SEED = 1111
+
+set_seed(RANDOM_SEED)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
-parser = argparse.ArgumentParser('THEGCN Node Classification on DGraphFin (TGL sampler)')
+parser = argparse.ArgumentParser('TGAT Node Classification on DGraphFin (TGL sampler)')
 parser.add_argument('-d', '--data',       type=str,   default='DGraphFin')
 parser.add_argument('--data_dir',         type=str,   default='./datasets')
 parser.add_argument('--sampler_dir',     type=str,   default='./processed_data/tgl',
@@ -75,21 +77,20 @@ parser.add_argument('--lr',               type=float, default=1e-3)
 parser.add_argument('--drop_out',         type=float, default=0.2)
 parser.add_argument('--gpu',              type=int,   default=0)
 parser.add_argument('--n_layer',          type=int,   default=2,
-                    help='Number of SMP layers (L in paper). 0 = TMP only.')
+                    help='Number of GATConv latyers.')
 parser.add_argument('--node_dim',         type=int,   default=128,
-                    help='Hidden dimension for SMP layers and classifier.')
+                    help='Hidden dimension for GATConv layers.')
 parser.add_argument('--time_dim',         type=int,   default=100,
                     help='Dimension of sinusoidal time encoding.')
 parser.add_argument('--feat_augment',     action='store_true', default=False,
                     help='whether to augment features')
+parser.add_argument('--n_head',           type=int,   default=4,)
 
-parser.add_argument('--num_threads',      type=int,   default=1,
+parser.add_argument('--num_threads',      type=int,   default=8,
                     help='Total OMP threads for C++ sampler.')
 parser.add_argument('--num_workers',      type=int,   default=1,
                     help='Number of sampler workers (num_thread_per_worker = num_threads // num_workers).')
 
-parser.add_argument('--n_hop',           type=int, default=2,
-                    help="Number of hops to sample neighbors")
 parser.add_argument('--n_neighbor',       type=int,   default=10,
                     help='Neighbours sampled per layer.')
 parser.add_argument('--strategy',         type=str, default='uniform',  
@@ -120,7 +121,6 @@ parser.add_argument('--reduction',       type=str, default='mean',
 parser.add_argument('--weight_decay',     type=float, default=5e-7)
 parser.add_argument('--to_undirected',    action='store_true', default=False)
 parser.add_argument('--early_stop_higher_better', action='store_true', default=False)
-parser.add_argument('--seed',             type=int, default=1111)
 
 
 try:
@@ -128,10 +128,6 @@ try:
 except SystemExit:
     parser.print_help()
     sys.exit(0)
-
-
-RANDOM_SEED = args.seed
-set_seed(RANDOM_SEED)
 
 BATCH_SIZE    = args.bs
 NUM_EPOCH     = args.n_epoch
@@ -144,8 +140,7 @@ NODE_DIM      = args.node_dim
 TIME_DIM      = args.time_dim
 FEAT_AUGMENT  = args.feat_augment
 NUM_LAYER     = args.n_layer
-
-NUM_HOPS      = args.n_hop
+NUM_HEAD      = args.n_head
 NUM_NEIGHBOR  = args.n_neighbor
 STRATEGY      = args.strategy
 PROP_TIME     = args.prop_time
@@ -212,10 +207,10 @@ g_val, _   = load_graph(args.sampler_dir, mode='val')
 g_test, _  = load_graph(args.sampler_dir, mode='test')
 
 # num_neighbors per layer: outer → inner, linearly decreasing
-if NUM_HOPS == 1:
+if NUM_LAYER == 1:
     num_neighbors = [NUM_NEIGHBOR]
 else:
-    num_neighbors = [NUM_NEIGHBOR] * NUM_HOPS
+    num_neighbors = [NUM_NEIGHBOR] * NUM_LAYER
 
 sampler_train = ParallelSampler(
     g_train['indptr'], 
@@ -224,7 +219,7 @@ sampler_train = ParallelSampler(
     g_train['ts'].astype(np.float32),
     NUM_THREADS, 
     NUM_WORKERS,                               # num_workers
-    NUM_HOPS, 
+    NUM_LAYER, 
     num_neighbors,
     STRATEGY=='recent', 
     PROP_TIME,
@@ -239,7 +234,7 @@ sampler_val   = ParallelSampler(
     g_val['ts'].astype(np.float32),
     NUM_THREADS, 
     NUM_WORKERS,                               # num_workers
-    NUM_HOPS, 
+    NUM_LAYER, 
     num_neighbors,
     STRATEGY=='recent', 
     PROP_TIME,
@@ -254,7 +249,7 @@ sampler_test  = ParallelSampler(
     g_test['ts'].astype(np.float32),
     NUM_THREADS, 
     NUM_WORKERS,                               # num_workers
-    NUM_HOPS, 
+    NUM_LAYER, 
     num_neighbors,
     STRATEGY=='recent', 
     PROP_TIME,
@@ -276,17 +271,18 @@ y_all         = y_all.to(device)
 # Model
 # ─────────────────────────────────────────────────────────────────────────────
 
-model = THEGCNModel(
+model = TGATModel(
     in_channels     = node_feat_dim,
     hidden_channels = NODE_DIM,
-    n_smp_layers    = NUM_LAYER,
+    n_layers        = NUM_LAYER,
+    n_head          = NUM_HEAD,
     time_dim        = TIME_DIM,
     dropout         = DROP_OUT,
     feature_augment = FEAT_AUGMENT,
 ).to(device)
 
 logger.info(
-    f'THEGCN | smp_layers: {NUM_LAYER} | hidden: {NODE_DIM} | '
+    f'TGAT | num_layers: {NUM_LAYER} | hidden: {NODE_DIM} | '
     f'time_dim: {TIME_DIM} | '
     f'params: {sum(p.numel() for p in model.parameters()):,}'
 )
@@ -306,13 +302,13 @@ elif LOSS == 'focal':
     logger.info(f"Using BalancedFocalLoss with alpha: {args.alpha:.2f}, gamma: {args.gamma:.2f}, reduction: {args.reduction}")
     criterion = BalancedFocalLoss(alpha=args.alpha, gamma=args.gamma, reduction=args.reduction).to(device)
 
+
 optimizer  = torch.optim.Adam(
     model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
 )
 scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode='max', factor=0.3, patience=3, min_lr=1e-6
 )
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -390,9 +386,8 @@ val_auc_hist     = []
 
 train_idx_np = train_idx.cpu().numpy()
 
-
 # create experiment
-EXPERIMENT_NAME = 'temporal-gnn-thegcn-editing'
+EXPERIMENT_NAME = 'temporal-gnn-tgat-editing'
 mlflow.set_experiment(EXPERIMENT_NAME)
 
 MODEL_SAVE_PATH     = f'./saved_models/{EXPERIMENT_NAME}-{args.prefix}-{DATA}.pth'
@@ -453,7 +448,6 @@ with mlflow.start_run():
         val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, _, _, val_loss = eval_nodes(val_idx, criterion, sampler_val)
         scheduler.step(val_ap)
 
-
         logger.info(
             f'Epoch {epoch} | loss: {np.mean(m_loss):.4f} | val_loss: {val_loss:.4f} | '
             f'val auc: {val_auc:.4f} | val ap: {val_ap:.4f} | '
@@ -473,7 +467,7 @@ with mlflow.start_run():
 
         train_loss_hist.append(np.mean(m_loss))
         val_loss_hist.append(val_loss)
-        val_auc_hist.append(val_ap)
+        val_auc_hist.append(val_auc)
 
         if early_stopper.early_stop_check(val_ap):
             logger.info(f'Early stopping at epoch {epoch}')

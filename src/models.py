@@ -721,3 +721,567 @@ class THEGCNSamplerModel(torch.nn.Module):
         # corresponds to the seed nodes.
         return self.clf(h[:batch_size]).squeeze(-1)                     # [batch_size]
  
+
+
+############# edited model ################
+
+class TGATModel(torch.nn.Module):
+    """
+    TGAT variant that accepts pre-sampled batch_inputs from the TGL C++
+    ParallelSampler via to_dgl_blocks + to_pyg_inputs.
+ 
+    Compared to TGAT:
+    - dts (Δt per edge) is provided directly from the sampler — no need to
+      recompute rel_t inside the model.
+    - node features are looked up from the global x_all matrix using node_ids
+      returned by the sampler, so x is not passed directly.
+    - Works with HISTORY=1 (TGAT-style, one temporal snapshot per layer).
+ 
+    Parameters
+    ----------
+    in_channels : int
+    hidden_channels : int
+    n_smp_layers : int
+        Number of SMP layers (L in paper). 0 = TMP only.
+    time_dim : int
+    dropout : float
+    """
+ 
+    def __init__(
+        self,
+        in_channels:     int,
+        hidden_channels: int,
+        n_layers:        int,
+        n_head:          int,
+        time_dim:        int,
+        dropout:         float = 0.2,
+        feature_augment: bool = False,
+    ):
+        super().__init__()
+        assert hidden_channels % n_head == 0, \
+            f'hidden_channels ({hidden_channels}) must be divisible by n_head ({n_head})'
+
+        self.time_enc   = TimeEncode(time_dim)
+        self.feature_augment = feature_augment
+        if self.feature_augment:
+            in_channels += 7
+
+        self.input_proj = torch.nn.Linear(in_channels, hidden_channels)
+        self.dropout    = dropout
+        self.n_layers   = n_layers
+
+        self.convs = torch.nn.ModuleList()
+        self.norms = torch.nn.ModuleList()
+
+        for _ in range(n_layers):
+            self.convs.append(
+                TransformerConv(
+                    in_channels  = hidden_channels,
+                    out_channels = hidden_channels // n_head,
+                    heads        = n_head,
+                    edge_dim     = time_dim,
+                    dropout      = dropout,
+                    concat       = True,
+                    beta         = False,
+                )
+            )
+            self.norms.append(torch.nn.BatchNorm1d(hidden_channels))
+
+        self.clf = torch.nn.Sequential(
+            torch.nn.Linear(hidden_channels, hidden_channels),
+            torch.nn.BatchNorm1d(hidden_channels),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_channels, hidden_channels // 2),
+            torch.nn.BatchNorm1d(hidden_channels // 2),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_channels // 2, 1),
+        )
+
+    def _combine_blocks(self, batch_inputs, batch_size, device):
+        """
+        Merge ALL sampler blocks (all hops) into ONE flat graph S,
+        matching the paper's "temporally sampled graph" construction.
+ 
+        The TGL sampler returns one block per hop:
+          batch_inputs[0]  = outermost hop (h_max-hop neighbours)
+          batch_inputs[-1] = innermost hop (1-hop neighbours of seeds)
+ 
+        Each block has node_ids, edge_index (local), edge_dts.
+        We combine ALL their edges into one graph with a unified node list
+        where seed nodes occupy positions 0..batch_size-1.
+ 
+        Returns
+        -------
+        all_node_ids       : LongTensor [N_total]  global node ids, seeds first
+        combined_edge_index: LongTensor [2, E_total] local indices
+        combined_dts       : FloatTensor [E_total]
+        """
+        src_global_list, dst_global_list, dts_list = [], [], []
+ 
+        for layer_blocks in batch_inputs:
+            for block in layer_blocks:
+                node_ids   = block['node_ids']    # [N_block] global
+                edge_index = block['edge_index']  # [2, E_block] local
+                dts        = block['edge_dts']    # [E_block]
+ 
+                src_global_list.append(node_ids[edge_index[0]])
+                dst_global_list.append(node_ids[edge_index[1]])
+                dts_list.append(dts)
+ 
+        all_src = torch.cat(src_global_list)   # [E_total]
+        all_dst = torch.cat(dst_global_list)   # [E_total]
+        all_dts = torch.cat(dts_list)          # [E_total]
+ 
+        # Seed nodes must be at positions 0..batch_size-1
+        seed_ids = batch_inputs[-1][0]['node_ids'][:batch_size]  # [B]
+ 
+        # All unique non-seed node ids
+        all_unique = torch.cat([all_src, all_dst]).unique()
+        non_seed_mask = ~torch.isin(all_unique, seed_ids)
+        non_seed_ids  = all_unique[non_seed_mask]
+ 
+        all_node_ids = torch.cat([seed_ids, non_seed_ids])  # [N_total], seeds first
+ 
+        # Build global → local lookup (sparse index tensor)
+        max_id = all_node_ids.max().item()
+        g2l    = torch.full((max_id + 1,), -1, dtype=torch.long, device=device)
+        g2l[all_node_ids] = torch.arange(len(all_node_ids), device=device)
+ 
+        combined_edge_index = torch.stack([g2l[all_src], g2l[all_dst]], dim=0)  # [2, E_total]
+ 
+        return all_node_ids, combined_edge_index, all_dts
+
+    def _augment_features(
+        self,
+        x_base:     torch.Tensor,   # [N_sub, base_in_channels]
+        node_ids:   torch.Tensor,   # [N_sub]  global ids (unused here, kept for API)
+        edge_index: torch.Tensor,   # [2, E]   local index space
+        edge_dts:   torch.Tensor,   # [E]      Δt = query_ts[dst] - edge_ts
+        n_seeds:    int,
+    ) -> torch.Tensor:              # [N_sub, base_in_channels + N_EXTRA]
+        """
+        Compute structural and temporal features from the sampled subgraph
+        and concatenate with base node features.
+ 
+        All features are derived solely from edges the TGL sampler returned
+        (t_edge < t_query enforced by sampler) — no additional leakage risk.
+        Normalised using seed-node statistics only to avoid neighbour
+        distribution leakage.
+        """
+        n_sub  = x_base.shape[0]
+        device = x_base.device
+        src_l, dst_l = edge_index                        # [E] local indices
+ 
+        ones = torch.ones(src_l.shape[0], device=device)
+ 
+        # ── structural ────────────────────────────────────────────────────────
+        out_deg   = torch.zeros(n_sub, device=device).scatter_add_(0, src_l, ones)
+        in_deg    = torch.zeros(n_sub, device=device).scatter_add_(0, dst_l, ones)
+        deg_ratio = out_deg / (in_deg + 1.0)             # avoids div-by-zero
+ 
+        # ── temporal (edge_dts = query_ts[dst] - edge_ts, larger = older) ────
+        INF = torch.full((n_sub,), 1e9, device=device)
+ 
+        # most recent edge per dst: smallest dts value
+        min_dts = INF.clone().scatter_reduce_(
+            0, dst_l, edge_dts, reduce='amin', include_self=True
+        )
+        # oldest edge per dst: largest dts value
+        max_dts = torch.zeros(n_sub, device=device).scatter_reduce_(
+            0, dst_l, edge_dts, reduce='amax', include_self=True
+        )
+        # recency: how recent is the node's newest valid edge
+        recency = min_dts.clamp(max=1e8)                 # cap sentinels
+ 
+        # burst ratio: fraction of edges in the most recent 25% of activity window
+        activity_window = (max_dts - min_dts).clamp(min=1.0)
+        burst_cutoff    = min_dts + 0.25 * activity_window   # [N_sub]
+        is_burst        = (edge_dts <= burst_cutoff[dst_l]).float()
+        burst_count     = torch.zeros(n_sub, device=device).scatter_add_(
+            0, dst_l, is_burst
+        )
+        burst_ratio = burst_count / in_deg.clamp(min=1.0)
+ 
+        # mean and std of dts per dst node (temporal diversity of neighbourhood)
+        mean_dts = torch.zeros(n_sub, device=device).scatter_reduce_(
+            0, dst_l, edge_dts, reduce='mean', include_self=False
+        )
+        dts_sq   = torch.zeros(n_sub, device=device).scatter_reduce_(
+            0, dst_l, edge_dts ** 2, reduce='mean', include_self=False
+        )
+        std_dts  = (dts_sq - mean_dts ** 2).clamp(min=0).sqrt()
+ 
+        # ── stack extra features ──────────────────────────────────────────────
+        extra = torch.stack([
+            out_deg, in_deg, deg_ratio,
+            recency, burst_ratio, mean_dts, std_dts,
+        ], dim=1).float()                                # [N_sub, N_EXTRA]
+ 
+        # normalise using seed-node mean/std to avoid neighbour dist leakage
+        mean = extra[:n_seeds].mean(0)
+        std  = extra[:n_seeds].std(0).clamp(min=1e-8)
+        extra = (extra - mean) / std
+ 
+        return torch.cat([x_base, extra], dim=1)         # [N_sub, base+N_EXTRA]
+ 
+    def forward(
+        self,
+        x_all:        torch.Tensor,  # [N_global, base_in_channels]
+        batch_inputs: list,          # from to_pyg_inputs(to_dgl_blocks(ret))
+        batch_size:   int,
+    ) -> torch.Tensor:               # [batch_size] logits
+
+        device = x_all.device
+
+        # ── Step 1: build flat graph for feature augmentation only ────────────
+        # All hops are merged so augmented features (degree, recency, burst
+        # ratio, etc.) reflect the full sampled neighbourhood, not just one hop.
+        all_node_ids, combined_edge_index, combined_dts = self._combine_blocks(
+            batch_inputs, batch_size, device
+        )
+
+        # Build global → flat-local lookup for remapping per-block edge indices
+        max_id = all_node_ids.max().item()
+        g2l    = torch.full((max_id + 1,), -1, dtype=torch.long, device=device)
+        g2l[all_node_ids] = torch.arange(len(all_node_ids), device=device)
+
+        # ── Step 2: node features + augmentation on full subgraph ────────────
+        x = x_all[all_node_ids]                                    # [N_total, base]
+        if self.feature_augment:
+            x = self._augment_features(
+                x, all_node_ids, combined_edge_index, combined_dts, batch_size
+            )                                                      # [N_total, base+7]
+
+        # ── Step 3: project all nodes to hidden dim ───────────────────────────
+        h = F.relu(self.input_proj(x))                             # [N_total, hidden]
+
+        # ── Step 4: per-layer message passing, innermost → outermost ─────────
+        # Layer i uses batch_inputs[-(i+1)][0]: the (i+1)-th hop from seeds.
+        # Each block's edge_index is block-local so we remap via g2l to the
+        # flat-graph index space where h lives, keeping h shape [N_total, hidden]
+        # throughout so source node embeddings are always available.
+        for i, (conv, norm) in enumerate(zip(self.convs, self.norms)):
+            block      = batch_inputs[-(i + 1)][0]
+            node_ids_b = block['node_ids']                         # [N_block] global
+            edge_idx_b = block['edge_index']                       # [2, E_block] block-local
+            dts_b      = block['edge_dts']                         # [E_block]
+
+            # Remap block-local indices → flat-graph local indices
+            src_global = node_ids_b[edge_idx_b[0]]                # [E_block] global
+            dst_global = node_ids_b[edge_idx_b[1]]                # [E_block] global
+            edge_index_flat = torch.stack([g2l[src_global],
+                                           g2l[dst_global]], dim=0)  # [2, E_block]
+
+            # Time encoding for this hop's edges
+            rel_t_enc = self.time_enc(
+                dts_b.float().unsqueeze(1)
+            ).squeeze(1)                                           # [E_block, time_dim]
+
+            h = norm(conv(h, edge_index_flat, edge_attr=rel_t_enc).relu())
+            h = F.dropout(h, p=self.dropout, training=self.training)
+
+        # ── Step 5: classify seed nodes only ─────────────────────────────────
+        # Seeds occupy positions 0..batch_size-1 (guaranteed by _combine_blocks)
+        return self.clf(h[:batch_size]).squeeze(-1)                # [batch_size]
+
+
+class THEGCNModel(torch.nn.Module):
+    """
+    THEGCN for use with the TGL C++ ParallelSampler.
+ 
+    Algorithm 1 in Yan et al. 2025:
+      1. Sampler returns S = all edges within h_max hops (multiple blocks)
+      2. _combine_blocks() merges ALL blocks into ONE flat graph
+      3. TMP applied ONCE to all edges in the flat graph  → h^(1) for all nodes
+      4. SMP applied L times to the SAME flat graph       → h^(L+1) for all nodes
+      5. Classify seed nodes only: clf(h[:batch_size])
+ 
+    h_max (number of sampler hops = len(batch_inputs)) and
+    n_smp_layers L (number of SMP layers) are INDEPENDENT hyperparameters.
+ 
+    Parameters
+    ----------
+    in_channels : int
+    hidden_channels  : int
+    n_smp_layers     : int   L in the paper
+    time_dim         : int
+    dropout          : float
+    """
+ 
+    # N_EXTRA = 7  # out_deg, in_deg, deg_ratio, recency, burst_ratio, mean_dts, std_dts
+ 
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels:  int,
+        n_smp_layers:     int,
+        time_dim:         int, 
+        dropout:          float = 0.2,
+        feature_augment: bool = False,
+    ):
+        super().__init__()
+        # in_channels = base_in_channels + self.N_EXTRA
+        self.feature_augment = feature_augment
+        
+        if self.feature_augment:
+            in_channels += 7
+ 
+        self.time_enc     = TimeEncode(time_dim)
+        self.dropout      = dropout
+        self.n_smp_layers = n_smp_layers
+ 
+        # TMP block — operates in raw feature space (in_channels)
+        self.tmp        = TMPConv(in_channels=in_channels, time_dim=time_dim)
+ 
+        # Linear projection: in_channels → hidden_channels before SMP
+        self.input_proj = torch.nn.Linear(in_channels, hidden_channels)
+ 
+        # SMP block — L layers, all operating on hidden_channels
+        self.smp_convs = torch.nn.ModuleList([
+            SMPConv(hidden_channels) for _ in range(n_smp_layers)
+        ])
+        self.smp_norms = torch.nn.ModuleList([
+            torch.nn.BatchNorm1d(hidden_channels) for _ in range(n_smp_layers)
+        ])
+ 
+        self.clf = torch.nn.Sequential(
+            torch.nn.Linear(hidden_channels, hidden_channels),
+            torch.nn.BatchNorm1d(hidden_channels),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_channels, hidden_channels // 2),
+            torch.nn.BatchNorm1d(hidden_channels // 2),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_channels // 2, 1),
+        )
+ 
+    # ── block combination ─────────────────────────────────────────────────────
+ 
+    def _combine_blocks(self, batch_inputs, batch_size, device):
+        """
+        Merge ALL sampler blocks (all hops) into ONE flat graph S,
+        matching the paper's "temporally sampled graph" construction.
+ 
+        The TGL sampler returns one block per hop:
+          batch_inputs[0]  = outermost hop (h_max-hop neighbours)
+          batch_inputs[-1] = innermost hop (1-hop neighbours of seeds)
+ 
+        Each block has node_ids, edge_index (local), edge_dts.
+        We combine ALL their edges into one graph with a unified node list
+        where seed nodes occupy positions 0..batch_size-1.
+ 
+        Returns
+        -------
+        all_node_ids       : LongTensor [N_total]  global node ids, seeds first
+        combined_edge_index: LongTensor [2, E_total] local indices
+        combined_dts       : FloatTensor [E_total]
+        """
+        src_global_list, dst_global_list, dts_list = [], [], []
+ 
+        for layer_blocks in batch_inputs:
+            for block in layer_blocks:
+                node_ids   = block['node_ids']    # [N_block] global
+                edge_index = block['edge_index']  # [2, E_block] local
+                dts        = block['edge_dts']    # [E_block]
+ 
+                src_global_list.append(node_ids[edge_index[0]])
+                dst_global_list.append(node_ids[edge_index[1]])
+                dts_list.append(dts)
+ 
+        all_src = torch.cat(src_global_list)   # [E_total]
+        all_dst = torch.cat(dst_global_list)   # [E_total]
+        all_dts = torch.cat(dts_list)          # [E_total]
+ 
+        # Seed nodes must be at positions 0..batch_size-1
+        seed_ids = batch_inputs[-1][0]['node_ids'][:batch_size]  # [B]
+ 
+        # All unique non-seed node ids
+        all_unique = torch.cat([all_src, all_dst]).unique()
+        non_seed_mask = ~torch.isin(all_unique, seed_ids)
+        non_seed_ids  = all_unique[non_seed_mask]
+ 
+        all_node_ids = torch.cat([seed_ids, non_seed_ids])  # [N_total], seeds first
+ 
+        # Build global → local lookup (sparse index tensor)
+        max_id = all_node_ids.max().item()
+        g2l    = torch.full((max_id + 1,), -1, dtype=torch.long, device=device)
+        g2l[all_node_ids] = torch.arange(len(all_node_ids), device=device)
+ 
+        combined_edge_index = torch.stack([g2l[all_src], g2l[all_dst]], dim=0)  # [2, E_total]
+ 
+        return all_node_ids, combined_edge_index, all_dts
+ 
+    # ── feature augmentation ──────────────────────────────────────────────────
+ 
+    def _augment_features(self, x_base, node_ids, edge_index, edge_dts, n_seeds):
+        """
+        Compute structural + temporal features from the combined flat graph.
+        Mirrors ml_data_preprocess.py logic — same 7 features, same definitions.
+        """
+        n_sub  = x_base.shape[0]
+        device = x_base.device
+        src_l, dst_l = edge_index    # [E_total] local
+ 
+        ones    = torch.ones(src_l.shape[0], device=device)
+        out_deg = torch.zeros(n_sub, device=device).scatter_add_(0, src_l, ones)
+        in_deg  = torch.zeros(n_sub, device=device).scatter_add_(0, dst_l, ones)
+        deg_ratio = out_deg / (in_deg + 1.0)
+ 
+        INF     = torch.full((n_sub,), 1e9, device=device)
+        recency = INF.clone().scatter_reduce_(
+            0, dst_l, edge_dts, reduce='amin', include_self=True
+        ).clamp(max=1e8)
+ 
+        max_dts = torch.zeros(n_sub, device=device).scatter_reduce_(
+            0, dst_l, edge_dts, reduce='amax', include_self=True
+        )
+        activity_window = (max_dts - recency).clamp(min=1.0)
+        burst_cutoff    = recency + 0.25 * activity_window
+        is_burst        = (edge_dts <= burst_cutoff[dst_l]).float()
+        burst_count     = torch.zeros(n_sub, device=device).scatter_add_(0, dst_l, is_burst)
+        burst_ratio     = burst_count / in_deg.clamp(min=1.0)
+ 
+        mean_dts = torch.zeros(n_sub, device=device).scatter_reduce_(
+            0, dst_l, edge_dts, reduce='mean', include_self=False
+        )
+        dts_sq   = torch.zeros(n_sub, device=device).scatter_reduce_(
+            0, dst_l, edge_dts ** 2, reduce='mean', include_self=False
+        )
+        std_dts  = (dts_sq - mean_dts ** 2).clamp(min=0).sqrt()
+ 
+        extra = torch.stack([
+            out_deg, in_deg, deg_ratio,
+            recency, burst_ratio, mean_dts, std_dts,
+        ], dim=1).float()                               # [N_total, 7]
+ 
+        # Normalise using seed-node statistics only
+        mean  = extra[:n_seeds].mean(0)
+        std   = extra[:n_seeds].std(0).clamp(min=1e-8)
+        extra = (extra - mean) / std
+ 
+        return torch.cat([x_base, extra], dim=1)        # [N_total, base+7]
+ 
+    # ── forward ───────────────────────────────────────────────────────────────
+ 
+    def forward(
+        self,
+        x_all:        torch.Tensor,  # [N_global, base_in_channels]
+        batch_inputs: list,          # from to_pyg_inputs(to_dgl_blocks(ret))
+        batch_size:   int,
+    ) -> torch.Tensor:               # [batch_size] logits
+ 
+        device = x_all.device
+ 
+        # ── Step 1: merge ALL blocks into one flat graph S ────────────────────
+        # Matches paper: "combine all interactions to build S^{t'}_vj"
+        all_node_ids, edge_index, dts = self._combine_blocks(
+            batch_inputs, batch_size, device
+        )
+ 
+        # ── Step 2: node features + augmentation ─────────────────────────────
+        x = x_all[all_node_ids]                                    # [N_total, base]
+        # x      = self._augment_features(
+        #     x_base, all_node_ids, edge_index, dts, batch_size
+        # )                                                                # [N_total, base+7]
+        # feature augment
+        if self.feature_augment:
+            x      = self._augment_features(
+                x, all_node_ids, edge_index, dts, batch_size
+            )   
+ 
+        # ── Step 3: time encoding E(t'-t) for all edges ───────────────────────
+        # dts already = query_ts[dst] - edge_ts  (precomputed by TGL sampler)
+        rel_t_enc = self.time_enc(dts.float().unsqueeze(1)).squeeze(1)  # [E_total, time_dim]
+ 
+        # ── Step 4: TMP block (Eq. 4-5) — applied ONCE to all edges ──────────
+        # Computes h^(1) for ALL nodes in the flat graph
+        h = self.tmp(x, edge_index, rel_t_enc)                          # [N_total, in_channels]
+        h = F.dropout(h, p=self.dropout, training=self.training)
+ 
+        # ── Step 5: project to hidden dim ────────────────────────────────────
+        # (practical addition — paper keeps same dim throughout)
+        h = F.relu(self.input_proj(h))                                  # [N_total, hidden]
+ 
+        # ── Step 6: SMP block (Eq. 6-7) — L layers on SAME edge set ─────────
+        # Paper Eq. 7 is a pure residual update — NO ReLU between layers.
+        # BatchNorm kept for training stability (our addition).
+        for conv, norm in zip(self.smp_convs, self.smp_norms):
+            h = norm(conv(h, edge_index))     # NO ReLU — preserves signed signal
+            h = F.dropout(h, p=self.dropout, training=self.training)
+ 
+        # ── Step 7: classify seed nodes only ─────────────────────────────────
+        # Seeds occupy positions 0..batch_size-1 (guaranteed by _combine_blocks)
+        return self.clf(h[:batch_size]).squeeze(-1)                     # [batch_size]
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

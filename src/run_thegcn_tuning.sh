@@ -6,13 +6,14 @@ bs=512
 epochs=200
 node_dim=128
 time_dim=128
-neighbors=(5 10)
-durations=(0 730 365)
-layers=(2 3 4)
+smp_layers=1
+neighbors=(3 5 10)
+durations=(730 365 180 90 30)
+hops=(1 2 3)
 feat_aug_options=(true false)
 
 # Total runs calculation
-total_runs=$((${#feat_aug_options[@]} * ${#layers[@]} * ${#durations[@]} * ${#neighbors[@]}))
+total_runs=$((${#feat_aug_options[@]} * ${#hops[@]} * ${#durations[@]} * ${#neighbors[@]}))
 
 # Initialize run counter at 0
 run_id=0
@@ -26,13 +27,13 @@ for feat_augment in "${feat_aug_options[@]}"; do
         augment_flag=""
     fi
 
-    for l in "${layers[@]}"; do
+    for h in "${hops[@]}"; do
         for d in "${durations[@]}"; do
             for n in "${neighbors[@]}"; do
                 # Create the run prefix
                 prefix="run$run_id"
                 
-                echo "Running: $prefix ($((run_id + 1))/$total_runs) | aug=$feat_augment, layer=$l, duration=$d, neighbor=$n"
+                echo "Running: $prefix ($((run_id + 1))/$total_runs) | aug=$feat_augment, hops=$h, duration=$d, neighbor=$n"
                 
                 # Execute python script
                 python src/07_thegcn_tuning_with_sampler.py \
@@ -43,8 +44,9 @@ for feat_augment in "${feat_aug_options[@]}"; do
                     --loss focal \
                     --node_dim "$node_dim" \
                     --time_dim "$time_dim" \
-                    --n_layer "$l" \
+                    --n_layer "$smp_layers" \
                     --duration "$d" \
+                    --n_hop "$h"\
                     --n_neighbor "$n" \
                     --early_stop_higher_better \
                     $augment_flag

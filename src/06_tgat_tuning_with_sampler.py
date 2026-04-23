@@ -47,7 +47,7 @@ faulthandler.enable()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import TGATSamplerModel
+from models import TGATModel
 from utils import *
 from namespaces import DA
 from dgraphfin import load_dgraphfin_temporal
@@ -57,10 +57,6 @@ from sampler_core import ParallelSampler, TemporalGraphBlock
 os.makedirs(DA.paths.log,          exist_ok=True)
 os.makedirs('./saved_models',      exist_ok=True)
 os.makedirs('./saved_checkpoints', exist_ok=True)
-
-RANDOM_SEED = 1111
-
-set_seed(RANDOM_SEED)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -121,13 +117,16 @@ parser.add_argument('--reduction',       type=str, default='mean',
 parser.add_argument('--weight_decay',     type=float, default=5e-7)
 parser.add_argument('--to_undirected',    action='store_true', default=False)
 parser.add_argument('--early_stop_higher_better', action='store_true', default=False)
-
+parser.add_argument('--seed',             type=int, default=1111)
 
 try:
     args = parser.parse_args()
 except SystemExit:
     parser.print_help()
     sys.exit(0)
+
+RANDOM_SEED = args.seed
+set_seed(RANDOM_SEED)
 
 BATCH_SIZE    = args.bs
 NUM_EPOCH     = args.n_epoch
@@ -271,7 +270,7 @@ y_all         = y_all.to(device)
 # Model
 # ─────────────────────────────────────────────────────────────────────────────
 
-model = TGATSamplerModel(
+model = TGATModel(
     in_channels     = node_feat_dim,
     hidden_channels = NODE_DIM,
     n_layers        = NUM_LAYER,
@@ -360,13 +359,15 @@ def eval_nodes(split_idx, criterion, sampler):
     mcc = matthews_corrcoef(all_labels, pred_label)
     rc  = recall_score(all_labels, pred_label, zero_division=0)
     pr  = precision_score(all_labels, pred_label, zero_division=0)
+    rc_at_127  = recall_at_top_n_percent(all_labels, scores, 1.27)
+    pr_at_127  = precision_at_top_n_percent(all_labels, scores, 1.27)
 
     val_loss = criterion(
         torch.tensor(all_preds, device=device),
         torch.tensor(all_labels, device=device),
     ).item()
 
-    return auc, ap, f1, mcc, rc, pr, val_loss
+    return auc, ap, f1, mcc, rc, pr, rc_at_127, pr_at_127, val_loss
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training loop
@@ -385,7 +386,7 @@ val_auc_hist     = []
 train_idx_np = train_idx.cpu().numpy()
 
 # create experiment
-EXPERIMENT_NAME = 'temporal-gnn-tgat'
+EXPERIMENT_NAME = 'temporal-gnn-tgat-v2'
 mlflow.set_experiment(EXPERIMENT_NAME)
 
 MODEL_SAVE_PATH     = f'./saved_models/{EXPERIMENT_NAME}-{args.prefix}-{DATA}.pth'
@@ -443,7 +444,7 @@ with mlflow.start_run():
             pbar.set_postfix({'loss': f'{np.mean(m_loss):.4f}'})
 
         # validation
-        val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, val_loss = eval_nodes(val_idx, criterion, sampler_val)
+        val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, _, _, val_loss = eval_nodes(val_idx, criterion, sampler_val)
         scheduler.step(val_ap)
 
 
@@ -499,11 +500,11 @@ with mlflow.start_run():
     logger.info(f"Loading best model from epoch {early_stopper.best_epoch} for testing.")
     model.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch)))
 
-    test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, _ = eval_nodes(test_idx, criterion, sampler_test)
+    test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, test_rc_at_127, test_pr_at_127, _ = eval_nodes(test_idx, criterion, sampler_test)
     logger.info(
         f'Test | auc: {test_auc:.4f} | ap: {test_ap:.4f} | '
         f'f1: {test_f1:.4f} | mcc: {test_mcc:.4f} | '
-        f'recall: {test_rc:.4f} | precision: {test_pr:.4f}'
+        f'recall: {test_rc:.4f} | precision: {test_pr:.4f} | recall @ top 1.27%: {test_rc_at_127:.4f} | precision @ top 1.27%: {test_rc_at_127:.4f}'
     )
     mlflow.log_metrics({
         'test_auc':       test_auc,
@@ -512,44 +513,9 @@ with mlflow.start_run():
         'test_mcc':       test_mcc,
         'test_recall':    test_rc,
         'test_precision': test_pr,
+        'test_recall_top127': test_rc_at_127,
+        'test_precision_top127': test_pr_at_127,
     })
 
     torch.save(model.state_dict(), MODEL_SAVE_PATH)
     logger.info(f'Model saved to {MODEL_SAVE_PATH}')
-
-    # # ── training curve ───────────────────────────────────────────────────────
-    # epochs_list = list(range(len(train_loss_hist)))
-    # fig, ax1    = plt.subplots(figsize=(10, 5))
-
-    # color_train = '#e05c5c'
-    # color_val   = '#e09c5c'
-    # color_auc   = '#5c8de0'
-
-    # ax1.set_xlabel('Epoch')
-    # ax1.set_ylabel('Loss', color=color_train)
-    # ax1.plot(epochs_list, train_loss_hist, color=color_train, linewidth=2, label='Train Loss')
-    # ax1.plot(epochs_list, val_loss_hist,   color=color_val,   linewidth=2, linestyle='--', label='Val Loss')
-    # ax1.tick_params(axis='y', labelcolor=color_train)
-
-    # ax2 = ax1.twinx()
-    # ax2.set_ylabel('Val AUC', color=color_auc)
-    # ax2.plot(epochs_list, val_auc_hist, color=color_auc, linewidth=2, linestyle='--', label='Val AUC')
-    # ax2.tick_params(axis='y', labelcolor=color_auc)
-    # ax2.set_ylim(0, 1)
-
-    # best_ep = early_stopper.best_epoch
-    # ax2.axvline(x=best_ep, color='gray', linestyle=':', linewidth=1.5,
-    #             label=f'Best epoch ({best_ep})')
-
-    # lines1, labels1 = ax1.get_legend_handles_labels()
-    # lines2, labels2 = ax2.get_legend_handles_labels()
-    # ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
-
-    # plt.title('THEGCN (TGL sampler) — Training Curve')
-    # plt.tight_layout()
-
-    # plot_path = f'./saved_models/{EXPERIMENT_NAME}-{args.prefix}-{DATA}-training-curve.png'
-    # plt.savefig(plot_path, dpi=150)
-    # plt.close()
-    # mlflow.log_artifact(plot_path)
-    # logger.info(f'Training curve saved to {plot_path}')
