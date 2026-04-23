@@ -384,7 +384,6 @@ early_stopper    = EarlyStopMonitor(
     max_round    = MAX_ROUND,
     higher_better = EARLY_STOP_HIGHER_BETTER,
     tolerance    = TOLERANCE,
-    warmup_epochs=5,
 )
 last_saved_epoch = -1
 train_loss_hist  = []
