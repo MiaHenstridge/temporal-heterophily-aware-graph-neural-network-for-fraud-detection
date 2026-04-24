@@ -386,7 +386,7 @@ val_auc_hist     = []
 train_idx_np = train_idx.cpu().numpy()
 
 # create experiment
-EXPERIMENT_NAME = 'temporal-gnn-tgat-v2'
+EXPERIMENT_NAME = 'temporal-gnn-tgat-test'
 mlflow.set_experiment(EXPERIMENT_NAME)
 
 MODEL_SAVE_PATH     = f'./saved_models/{EXPERIMENT_NAME}-{args.prefix}-{DATA}.pth'
