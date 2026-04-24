@@ -48,7 +48,7 @@ faulthandler.enable()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import THEGCNSamplerModel, THEGCNModel
+from models import THEGCNModel
 from utils import *
 from namespaces import DA
 from dgraphfin import load_dgraphfin_temporal
@@ -394,7 +394,7 @@ train_idx_np = train_idx.cpu().numpy()
 
 
 # create experiment
-EXPERIMENT_NAME = 'temporal-gnn-thegcn-v3'
+EXPERIMENT_NAME = 'temporal-gnn-thegcn-test'
 mlflow.set_experiment(EXPERIMENT_NAME)
 
 MODEL_SAVE_PATH     = f'./saved_models/{EXPERIMENT_NAME}-{args.prefix}-{DATA}.pth'

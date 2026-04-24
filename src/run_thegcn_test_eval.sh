@@ -6,12 +6,12 @@ epochs=200
 node_dim=128
 time_dim=128
 smp_layers=1
-neighbors=5
-duration=180
+neighbors=3
+duration=730
 hops=2
 feat_augment=true
 max_rounds=20
-seeds=(123 4444 1608 29 9999 777 4949 37 555 8888)
+seeds=(123 456 789 101112 131415 161718 192021 222324 252627 282930)
 
 # Fixed variable name from seed to seeds
 total_runs=$((${#seeds[@]}))

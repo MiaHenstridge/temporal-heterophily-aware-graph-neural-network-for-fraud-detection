@@ -10,13 +10,13 @@ smp_layers=1
 neighbors=(3 5 10)
 durations=(730 365 180 90 30)
 hops=(1 2 3)
-feat_aug_options=(true false)
+feat_aug_options=(false)
 
 # Total runs calculation
 total_runs=$((${#feat_aug_options[@]} * ${#hops[@]} * ${#durations[@]} * ${#neighbors[@]}))
 
 # Initialize run counter at 0
-run_id=0
+run_id=47
 
 for feat_augment in "${feat_aug_options[@]}"; do
     
