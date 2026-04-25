@@ -33,10 +33,6 @@ os.makedirs(DA.paths.log, exist_ok=True)
 os.makedirs('./saved_models', exist_ok=True)
 os.makedirs('./saved_checkpoints', exist_ok=True)
 
-RANDOM_SEED = 1111
-
-set_seed(RANDOM_SEED)
-
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -83,6 +79,16 @@ parser.add_argument('--reduction',       type=str, default='mean',
 parser.add_argument('--num_workers',     type=int,   default=12)
 parser.add_argument('--weight_decay',    type=float, default=5e-7)
 parser.add_argument('--early_stop_higher_better', action='store_true', default=False)
+parser.add_argument('--seed',             type=int, default=1111)
+
+try:
+    args = parser.parse_args()
+except SystemExit:
+    parser.print_help()
+    sys.exit(0)
+
+RANDOM_SEED = args.seed
+set_seed(RANDOM_SEED)
 
 try:
     args = parser.parse_args()
