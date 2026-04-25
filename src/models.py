@@ -516,7 +516,7 @@ class TMPConv(MessagePassing):
     Temporal Message Passing block for THEGCN.
     
     For each directed edge (src → dst) with relative time Δt = t\'_dst - t_edge:
-        p = σ( MLP([x_src || x_dst || E(Δt)]) )        low-pass weight ∈ (0,1)
+        p = σ( MLP([x_src || x_dst || E(Δt)]) )        low-pass weight ∈ (-1,1)
         q = 1 - p                                        high-pass weight
         message = (p - q) * x_src                       signed, can be negative
  
@@ -567,7 +567,7 @@ class SMPConv(MessagePassing):
     """
     Static Messsage Passing block for THEGCN.
     Operates on node embeddings after the TMP block. No time information.
-        p = σ( MLP([h_src^(l) || h_dst^(l)]) )         low-pass weight ∈ (0,1)
+        p = σ( MLP([h_src^(l) || h_dst^(l)]) )         low-pass weight ∈ (-1,1)
         q = 1 - p
         h_dst^(l+1) = h_dst^(l) + mean_{neighbours} (p - q) * h_src^(l)
  

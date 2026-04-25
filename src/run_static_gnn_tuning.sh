@@ -6,8 +6,8 @@ lr=1e-4
 bs=512
 epochs=200
 node_dim=128
-neighbors=(5 10)
-layers=(2 3 4)
+neighbors=(3 5 10)
+layers=(1 2 3)
 feat_aug_options=(true false)
 
 # Total runs per model (now includes the augmentation dimension)

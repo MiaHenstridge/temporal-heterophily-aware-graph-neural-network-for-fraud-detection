@@ -282,13 +282,15 @@ def eval_nodes(loader, criterion):
     mcc = matthews_corrcoef(all_labels, pred_label)
     rc  = recall_score(all_labels, pred_label, zero_division=0)
     pr  = precision_score(all_labels, pred_label, zero_division=0)
+    rc_at_127  = recall_at_top_n_percent(all_labels, scores, 1.27)
+    pr_at_127  = precision_at_top_n_percent(all_labels, scores, 1.27)
 
     val_loss = criterion(
         torch.tensor(all_preds, device=device),
         torch.tensor(all_labels, device=device),
     ).item()
 
-    return auc, ap, f1, mcc, rc, pr, val_loss
+    return auc, ap, f1, mcc, rc, pr, rc_at_127, pr_at_127, val_loss
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training loop
@@ -337,7 +339,8 @@ with mlflow.start_run():
             m_loss.append(loss.item())
             pbar.set_postfix({'loss': f'{np.mean(m_loss):.4f}'})
 
-        val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, val_loss = eval_nodes(val_loader, criterion)
+        # validation
+        val_auc, val_ap, val_f1, val_mcc, val_rc, val_pr, _, _, val_loss = eval_nodes(val_loader, criterion)
         scheduler.step(val_ap)
 
         logger.info(
@@ -393,11 +396,11 @@ with mlflow.start_run():
     logger.info(f"Loading best model from epoch {early_stopper.best_epoch} for testing.")
     model.load_state_dict(torch.load(get_checkpoint_path(early_stopper.best_epoch)))
     
-    test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, _ = eval_nodes(test_loader, criterion)
+    test_auc, test_ap, test_f1, test_mcc, test_rc, test_pr, test_rc_at_127, test_pr_at_127, _ = eval_nodes(test_loader, criterion)
     logger.info(
         f'Test | auc: {test_auc:.4f} | ap: {test_ap:.4f} | '
         f'f1: {test_f1:.4f} | mcc: {test_mcc:.4f} | '
-        f'recall: {test_rc:.4f} | precision: {test_pr:.4f}'
+        f'recall: {test_rc:.4f} | precision: {test_pr:.4f} | recall @ top 1.27%: {test_rc_at_127:.4f} | precision @ top 1.27%: {test_rc_at_127:.4f}'
     )
     mlflow.log_metrics({
         'test_auc':       test_auc,
@@ -406,6 +409,8 @@ with mlflow.start_run():
         'test_mcc':       test_mcc,
         'test_recall':    test_rc,
         'test_precision': test_pr,
+        'test_recall_top127': test_rc_at_127,
+        'test_precision_top127': test_pr_at_127,
     })
 
     torch.save(model.state_dict(), MODEL_SAVE_PATH)
