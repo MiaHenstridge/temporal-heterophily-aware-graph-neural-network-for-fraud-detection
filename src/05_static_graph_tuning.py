@@ -314,7 +314,7 @@ val_loss_hist   = []
 val_auc_hist    = []
 
 # create experiment
-EXPERIMENT_NAME = f'static-gnn-{MODEL_TYPE}'
+EXPERIMENT_NAME = f'static-gnn-{MODEL_TYPE}-test'
 mlflow.set_experiment(EXPERIMENT_NAME)
 
 MODEL_SAVE_PATH     = f'./saved_models/{EXPERIMENT_NAME}-{args.prefix}-{DATA}.pth'

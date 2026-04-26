@@ -4,9 +4,7 @@ import torch
 import dgl
 import torch.nn.functional as F
 import random
-# from scipy.sparse import csr_matrix
-# from dgraphfin import load_dgraphfin_temporal
-# import sampler_core
+
 
 def set_seed(seed):
     random.seed(seed)

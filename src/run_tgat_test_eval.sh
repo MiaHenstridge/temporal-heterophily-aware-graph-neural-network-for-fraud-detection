@@ -5,11 +5,11 @@ bs=512
 epochs=200
 node_dim=128
 time_dim=128
-n_layers=3
+n_layers=2
 neighbors=10
-duration=180
-feat_augment=true
-max_rounds=20
+duration=730
+feat_augment=false
+max_rounds=10
 seeds=(123 456 789 101112 131415 161718 192021 222324 252627 282930)
 
 # Fixed variable name from seed to seeds
