@@ -43,9 +43,9 @@ class EarlyStopMonitor(object):
     
 
 # Balanced Focal Loss function
-class FocalLoss(torch.nn.Module):
+class BalancedFocalLoss(torch.nn.Module):
     """
-    Focal Loss for binary classification with severe class imbalance.
+    Balanced Focal Loss for binary classification with severe class imbalance.
  
     Formula (Lin et al., 2017):
         FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
