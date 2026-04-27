@@ -306,7 +306,7 @@ if LOSS == 'bce':
     criterion  = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 elif LOSS == 'focal':
     logger.info(f"Using BalancedFocalLoss with alpha: {args.alpha:.2f}, gamma: {args.gamma:.2f}, reduction: {args.reduction}")
-    criterion = BalancedFocalLoss(alpha=args.alpha, gamma=args.gamma, reduction=args.reduction).to(device)
+    criterion = FocalLoss(alpha=args.alpha, gamma=args.gamma, reduction=args.reduction).to(device)
 
 optimizer  = torch.optim.Adam(
     model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
