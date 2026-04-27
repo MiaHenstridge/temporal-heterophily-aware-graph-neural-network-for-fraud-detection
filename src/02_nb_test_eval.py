@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
 import os
+import sys
+import time
 
 from sklearn.metrics import roc_auc_score, precision_score, recall_score, f1_score, matthews_corrcoef, average_precision_score
 from sklearn.naive_bayes import GaussianNB
@@ -12,7 +14,9 @@ import warnings
 import argparse
 import logging
 from typing import *
+from utils import *
 
+import yaml
 from namespaces import DA
 
 logging.basicConfig(level=logging.WARN)
@@ -54,73 +58,99 @@ def eval_metrics(actual, pred_labels, pred_probas):
     precision = precision_score(actual, pred_labels)
     f1 = recall_score(actual, pred_labels)
     matthews_corr = matthews_corrcoef(actual, pred_labels)
-    return auc, ap, recall, precision, f1, matthews_corr
+    rc_at_127 = recall_at_top_n_percent(actual, pred_probas, 1.27)
+    pr_at_127 = precision_at_top_n_percent(actual, pred_probas, 1.27)
+    return auc, ap, recall, precision, f1, matthews_corr, rc_at_127, pr_at_127
 
-
-def parse_priors_input(input_str):
-    """
-    Parses a string like '0.9,0.1|0.8,0.2' 
-    into a list of lists: [[0.9, 0.1], [0.8, 0.2]]
-    """
-    sets = input_str.split('|')
-    return [list(map(float, s.split(','))) for s in sets]
 
 if __name__ == "__main__":
     # 1. Setup Arguments
     parser = argparse.ArgumentParser()
     # Accept a string representing multiple sets of priors
-    parser.add_argument("--priors_sweep", type=str, 
-                        default="0.99,0.01|0.98,0.02|0.95,0.05|0.90,0.10|0.50,0.50",
-                        help="Sets of priors separated by | (e.g. '0.9,0.1|0.8,0.2')")
     parser.add_argument("--feat_augment", action='store_true', default=False)
     args = parser.parse_args()
+
+    FEAT_AUGMENT = args.feat_augment
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Logger
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+    fh  = logging.FileHandler(os.path.join(DA.paths.log, f'{time.time()}.log'))
+    fh.setLevel(logging.DEBUG)
+    ch  = logging.StreamHandler()
+    ch.setLevel(logging.WARN)
+    fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh.setFormatter(fmt); ch.setFormatter(fmt)
+    logger.addHandler(fh); logger.addHandler(ch)
+    logger.info(args)
+
+    # load best params
+    logger.info(f"Feature Augmentation: {FEAT_AUGMENT}")
+    if FEAT_AUGMENT:
+        # load best params for feat augment
+        with open('hyperparameter_tuning/nb_best_params.yaml', 'r') as f:
+            best_params = yaml.safe_load(f)
+    else:
+        # load best params for no feat augment
+        with open('hyperparameter_tuning/nb_nofeat_best_params.yaml', 'r') as f:
+            best_params = yaml.safe_load(f)
+
     
-    # Parse the string into a list of lists
-    priors_to_test = parse_priors_input(args.priors_sweep)
+    best_params['priors'] = eval(best_params['priors'])  # Convert string back to list
     
     # 2. Load data ONCE
     X_train, X_val, X_test, y_train, y_val, y_test = load_data(data_path=DA.paths.output_data_ml, feat_augment=args.feat_augment)
     
     # 3. Set MLflow Experiment
-    mlflow.set_experiment(experiment_name="nb_priors_tuning")
+    EXPERIMENT_NAME = f"nb-test"
+    if not FEAT_AUGMENT:
+        EXPERIMENT_NAME += "-nofeat"
 
-    print(f"Starting runs for {len(priors_to_test)} prior configurations...")
+    mlflow.set_experiment(EXPERIMENT_NAME)
 
-    # 4. The Loop
-    for p_set in priors_to_test:
-        # Create a descriptive run name based on the priors
-        run_name = f"Priors_{p_set[0]}_{p_set[1]}"
-        
-        with mlflow.start_run(run_name=run_name):
-            # Build and Fit
-            model = build_naive_bayes_model(priors=p_set)
-            # GaussianNB expects y to be 1D
-            model.fit(X_train, y_train.values.ravel()) 
-            
-            # Predict
-            pred_probs = model.predict_proba(X_val)[:, 1]
-            pred_labels = model.predict(X_val)
-            
-            # Metrics
-            auc, ap, recall, precision, f1, matthews_corr = eval_metrics(
-                y_val, pred_labels=pred_labels, pred_probas=pred_probs
-            )
-            
-            # Log to MLflow
-            # We log the whole list as a string so MLflow displays it clearly
-            mlflow.log_param("priors", str(p_set))
-            mlflow.log_param("feat_augment", args.feat_augment)
-            
-            mlflow.log_metric("auc", auc)
-            mlflow.log_metric("ap", ap)
-            mlflow.log_metric("recall", recall)
-            mlflow.log_metric("precision", precision)
-            mlflow.log_metric("f1", f1)
-            mlflow.log_metric("mcc", matthews_corr)
-            
-            # Log the model
-            mlflow.sklearn.log_model(model, "model")
-            
-            print(f"Finished: {p_set} | AUC: {auc:.4f} | AP: {ap:.4f} | Recall: {recall:.4f} | Precision: {precision:.4f} | F1: {f1:.4f} | MCC: {matthews_corr:.4f}")
+    with mlflow.start_run():
+        mlflow.log_params(best_params)
 
-    print("\nRuns complete. Run 'mlflow ui' to compare the runs.")
+        # create model
+        logger.info(f"Best Hyperparameters: {best_params}")
+        model = build_naive_bayes_model(priors=best_params['priors'])
+        # fit model
+        model.fit(X_train, y_train.values.ravel())
+        # predict on val set
+        pred_probas = model.predict_proba(X_val)[:, 1]
+        pred_labels = model.predict(X_val)
+        # evaluate metrics
+        auc, ap, recall, precision, f1, mcc, rc_at_127, pr_at_127 = eval_metrics(y_val, pred_labels, pred_probas)
+        logger.info(f"Validation Metrics: AUC={auc:.4f}, AP={ap:.4f}, Recall={recall:.4f}, Precision={precision:.4f}, F1={f1:.4f}, Matthews Corr={mcc:.4f}, Recall@1.27%={rc_at_127:.4f}, Precision@1.27%={pr_at_127:.4f}")
+        mlflow.log_metrics({
+            "val_auc": auc,
+            "val_ap": ap,
+            "val_recall": recall,
+            "val_precision": precision,
+            "val_f1": f1,
+            "val_matthews_corr": mcc,
+            "val_recall_at_127": rc_at_127,
+            "val_precision_at_127": pr_at_127
+        })
+
+
+        # predict on test set
+        pred_probas = model.predict_proba(X_test)[:, 1]
+        pred_labels = model.predict(X_test)
+        # evaluate metrics
+        auc, ap, recall, precision, f1, mcc, rc_at_127, pr_at_127 = eval_metrics(y_test, pred_labels, pred_probas)
+        logger.info(f"Test Metrics: AUC={auc:.4f}, AP={ap:.4f}, Recall={recall:.4f}, Precision={precision:.4f}, F1={f1:.4f}, Matthews Corr={mcc:.4f}, Recall@1.27%={rc_at_127:.4f}, Precision@1.27%={pr_at_127:.4f}")
+        mlflow.log_metrics({
+            "test_auc": auc,
+            "test_ap": ap,
+            "test_recall": recall,
+            "test_precision": precision,
+            "test_f1": f1,
+            "test_matthews_corr": mcc,
+            "test_recall_at_127": rc_at_127,
+            "test_precision_at_127": pr_at_127,
+        })
