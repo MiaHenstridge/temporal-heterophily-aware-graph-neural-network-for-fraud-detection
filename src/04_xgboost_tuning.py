@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore")
 
 
-os.chdir('/home/mai/notebooks/final_thesis/')
+os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 print(f"Current working directory: {os.getcwd()}")
 
 
