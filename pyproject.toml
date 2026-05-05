@@ -27,6 +27,7 @@ dependencies = [
     "ipykernel",
     "optuna",
     "pybind11>=2.6.2",
+    "shap>=0.47,<1.0",
 ]
 
 [[tool.uv.index]]
@@ -36,6 +37,7 @@ explicit = true
 
 [tool.uv]
 find-links = ["https://data.dgl.ai/wheels/torch-2.4/cu124/repo.html"]
+constraint-dependencies = ["numba>=0.59"]
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu124" }]
