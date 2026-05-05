@@ -46,3 +46,6 @@ notebooks/*
 
 hyperparameter_tuning/*
 hyperparameter_tuning/
+
+plots/
+plots/*

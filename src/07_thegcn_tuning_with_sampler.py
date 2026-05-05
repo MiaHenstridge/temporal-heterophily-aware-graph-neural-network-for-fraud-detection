@@ -394,7 +394,7 @@ train_idx_np = train_idx.cpu().numpy()
 
 
 # create experiment
-EXPERIMENT_NAME = 'temporal-gnn-thegcn-test'
+EXPERIMENT_NAME = 'temporal-gnn-thegcn-exp'
 mlflow.set_experiment(EXPERIMENT_NAME)
 
 MODEL_SAVE_PATH     = f'./saved_models/{EXPERIMENT_NAME}-{args.prefix}-{DATA}.pth'
